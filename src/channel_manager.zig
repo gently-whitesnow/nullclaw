@@ -1239,49 +1239,51 @@ test "ChannelManager marks lark webhook receive_mode as webhook_only" {
 }
 
 test "ChannelManager collects web channel from config" {
-    if (!channel_catalog.isBuildEnabled(.web)) return;
+    // Тело читает поля настоящего WebChannel, поэтому при выключенном канале его
+    // нельзя даже анализировать: у stub этих полей нет.
+    if (comptime channel_catalog.isBuildEnabled(.web)) {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+        const web_accounts = [_]config_types.WebConfig{
+            .{
+                .account_id = "local",
+                .port = 32123,
+                .path = "/relay/",
+                .auth_token = "relay-token-0123456789",
+            },
+        };
 
-    const web_accounts = [_]config_types.WebConfig{
-        .{
-            .account_id = "local",
-            .port = 32123,
-            .path = "/relay/",
-            .auth_token = "relay-token-0123456789",
-        },
-    };
+        const config = Config{
+            .workspace_dir = "/tmp",
+            .config_path = "/tmp/config.json",
+            .allocator = allocator,
+            .channels = .{
+                .web = &web_accounts,
+            },
+        };
 
-    const config = Config{
-        .workspace_dir = "/tmp",
-        .config_path = "/tmp/config.json",
-        .allocator = allocator,
-        .channels = .{
-            .web = &web_accounts,
-        },
-    };
+        var reg = dispatch.ChannelRegistry.init(allocator);
+        defer reg.deinit();
 
-    var reg = dispatch.ChannelRegistry.init(allocator);
-    defer reg.deinit();
+        var event_bus = bus_mod.Bus.init();
 
-    var event_bus = bus_mod.Bus.init();
+        const mgr = try ChannelManager.init(allocator, &config, &reg);
+        defer mgr.deinit();
+        mgr.setEventBus(&event_bus);
 
-    const mgr = try ChannelManager.init(allocator, &config, &reg);
-    defer mgr.deinit();
-    mgr.setEventBus(&event_bus);
+        try mgr.collectConfiguredChannels();
 
-    try mgr.collectConfiguredChannels();
+        try expectEntryPresence(mgr.channelEntries(), "web", "local", true);
 
-    try expectEntryPresence(mgr.channelEntries(), "web", "local", true);
+        // Verify it was registered with correct listener type
+        const web_entry = findEntryByNameAccount(mgr.channelEntries(), "web", "local").?;
+        try std.testing.expectEqual(ListenerType.gateway_loop, web_entry.listener_type);
 
-    // Verify it was registered with correct listener type
-    const web_entry = findEntryByNameAccount(mgr.channelEntries(), "web", "local").?;
-    try std.testing.expectEqual(ListenerType.gateway_loop, web_entry.listener_type);
-
-    const web_ptr: *web.WebChannel = @ptrCast(@alignCast(web_entry.channel.ptr));
-    try std.testing.expect(web_ptr.bus == &event_bus);
-    try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
-    try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
+        const web_ptr: *web.WebChannel = @ptrCast(@alignCast(web_entry.channel.ptr));
+        try std.testing.expect(web_ptr.bus == &event_bus);
+        try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
+        try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
+    }
 }

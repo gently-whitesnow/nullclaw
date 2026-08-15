@@ -3101,6 +3101,7 @@ test "markInboundMessageRead dispatches through channel vtable" {
 }
 
 test "hasSupervisedChannels true for nostr" {
+    if (!channel_catalog.isBuildEnabled(.nostr)) return error.SkipZigTest;
     const config_types = @import("config_types.zig");
     var config = Config{
         .workspace_dir = "/tmp",

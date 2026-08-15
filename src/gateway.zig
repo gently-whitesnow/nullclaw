@@ -5239,6 +5239,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 test "handleWhatsAppWebhookRoute rejects malformed JSON before sender extraction" {
+    if (!build_options.enable_channel_whatsapp) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -9773,6 +9774,8 @@ test "gateway daemon mode keeps local agent runtime lazy even when a2a enabled" 
 }
 
 test "local agent runtime keeps policy and memory pointers stable" {
+    // Тест поднимает runtime на backend "none"; без этого движка mem_rt не создаётся.
+    if (!build_options.enable_memory_none) return error.SkipZigTest;
     var cfg = Config{
         .workspace_dir = "/tmp/yc_test",
         .config_path = "/tmp/yc_test/config.json",
