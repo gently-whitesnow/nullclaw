@@ -155,6 +155,17 @@ pub fn isRuntimeCommandRole(role: []const u8) bool {
     return std.mem.eql(u8, role, RUNTIME_COMMAND_ROLE);
 }
 
+/// Conversation cut written when a session is evicted for idleness. Stored as a
+/// runtime-command row so every history listing and retrieval path that already
+/// filters those rows keeps showing the transcript unchanged; only session
+/// restore reads it. No slash command produces this content, so it can never
+/// collide with a persisted user command.
+pub const SESSION_BOUNDARY_MARKER = "__idle_boundary__";
+
+pub fn isSessionBoundaryMarker(content: []const u8) bool {
+    return std.mem.eql(u8, content, SESSION_BOUNDARY_MARKER);
+}
+
 pub const MessageEntry = struct {
     role: []const u8,
     content: []const u8,
