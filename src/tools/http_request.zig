@@ -19,10 +19,10 @@ pub const HttpRequestTool = struct {
     timeout_secs: u64 = 60,
 
     pub const tool_name = "http_request";
-    pub const tool_description = "Make HTTPS requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
-        "Security: allowlist-only domains, SSRF protection, and allowlisted hosts may reach local/private addresses.";
+    pub const tool_description = "Make HTTP API requests. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
+        "Security: HTTPS everywhere except an allowlisted origin that pins its port, allowlist-only domains, SSRF protection, and allowlisted hosts may reach local/private addresses.";
     pub const tool_params =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to request"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"URL to request; HTTPS unless the allowlist pins this exact host and port"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -46,16 +46,24 @@ pub const HttpRequestTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
 
-        // Validate URL scheme - HTTPS only for security (AGENTS.md policy)
-        net_security.validateOutboundUrl(url) catch {
-            return ToolResult.fail("Only HTTPS URLs are allowed for security");
-        };
+        // Validate URL scheme - HTTPS only for security (AGENTS.md policy).
+        // The only exception is an origin the operator explicitly put in allowed_domains
+        // with its port: loopback services do not terminate TLS, so https:// there is
+        // unreachable. A port-less entry never grants it — otherwise trusting one
+        // loopback service would trust every other port on the same address.
+        const plain_http = std.ascii.startsWithIgnoreCase(url, "http://");
+        const scheme_exempt = plain_http and pinnedOriginAllowlisted(url, self.allowed_domains);
+        if (!scheme_exempt) {
+            net_security.validateOutboundUrl(url) catch {
+                return ToolResult.fail("Only HTTPS URLs are allowed for security");
+            };
+        }
 
         // Build URI
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
 
-        const resolved_port: u16 = uri.port orelse 443;
+        const resolved_port: u16 = uri.port orelse if (plain_http) 80 else 443;
 
         // Extract host
         const host = net_security.extractHost(url) orelse
@@ -64,7 +72,7 @@ pub const HttpRequestTool = struct {
         // Check domain allowlist BEFORE any DNS resolution.
         // This prevents DNS exfiltration and avoids unnecessary network calls.
         const is_allowlisted = if (self.allowed_domains.len > 0)
-            net_security.hostMatchesAllowlist(host, self.allowed_domains)
+            hostMatchesAllowlistWithPort(host, resolved_port, self.allowed_domains)
         else
             false;
 
@@ -191,6 +199,51 @@ pub const HttpRequestTool = struct {
         }
     }
 };
+
+/// Split an allowlist entry that pins a port ("127.0.0.1:8090", "[::1]:8090").
+/// A bare host, a bracketed IPv6 address and an unbracketed one all stay port-less.
+fn splitPinnedPort(pattern: []const u8) ?struct { host: []const u8, port: u16 } {
+    const colon = std.mem.lastIndexOfScalar(u8, pattern, ':') orelse return null;
+    if (std.mem.lastIndexOfScalar(u8, pattern, ']')) |bracket| {
+        if (bracket > colon) return null;
+    }
+    const host = pattern[0..colon];
+    if (host.len == 0 or host[host.len - 1] == ':') return null;
+    const port = std.fmt.parseInt(u16, pattern[colon + 1 ..], 10) catch return null;
+    return .{ .host = host, .port = port };
+}
+
+/// Allowlist match that honours a pinned port. Entries without one keep upstream
+/// host-only semantics, so existing configs behave exactly as before.
+fn hostMatchesAllowlistWithPort(host: []const u8, port: u16, allowed: []const []const u8) bool {
+    for (allowed) |pattern| {
+        if (splitPinnedPort(pattern)) |pinned| {
+            if (pinned.port != port) continue;
+            const single = [_][]const u8{pinned.host};
+            if (net_security.hostMatchesAllowlist(host, &single)) return true;
+            continue;
+        }
+        const single = [_][]const u8{pattern};
+        if (net_security.hostMatchesAllowlist(host, &single)) return true;
+    }
+    return false;
+}
+
+/// Whether the URL names an allowlist entry that pins its port. Only such an entry
+/// authorizes the plain-HTTP downgrade.
+fn pinnedOriginAllowlisted(url: []const u8, allowed: []const []const u8) bool {
+    if (allowed.len == 0) return false;
+    const uri = std.Uri.parse(url) catch return false;
+    const host = net_security.extractHost(url) orelse return false;
+    const port = uri.port orelse 80;
+    for (allowed) |pattern| {
+        const pinned = splitPinnedPort(pattern) orelse continue;
+        if (pinned.port != port) continue;
+        const single = [_][]const u8{pinned.host};
+        if (net_security.hostMatchesAllowlist(host, &single)) return true;
+    }
+    return false;
+}
 
 fn methodToSlice(method: std.http.Method) []const u8 {
     return switch (method) {
@@ -604,8 +657,7 @@ test "http_request schema has url" {
     const t = ht.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "url") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "HTTPS URL to request") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "HTTP or HTTPS URL to request") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "URL to request; HTTPS unless the allowlist pins this exact host and port") != null);
 }
 
 test "http_request schema has headers" {
@@ -833,6 +885,109 @@ test "execute allows allowlisted private IP (fixes #393)" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
+}
+
+test "execute allows plain HTTP for the pinned Overtime origin" {
+    // Loopback services (Overtime on 127.0.0.1:8090) do not terminate TLS, so the
+    // operator's allowlist entry — with its port — authorizes the scheme downgrade.
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1:8090/api/openapi/index\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
+}
+
+test "execute rejects another port on the pinned loopback address" {
+    // The gateway (:3210) and any other local service share the address; only the
+    // pinned origin may be reached.
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1:3210/a2a\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only HTTPS URLs are allowed for security", result.error_msg.?);
+}
+
+test "execute rejects another port even over https" {
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1:3210/a2a\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
+}
+
+test "execute rejects the implicit port when the allowlist pins another one" {
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1/api/tasks\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only HTTPS URLs are allowed for security", result.error_msg.?);
+}
+
+test "execute keeps rejecting plain HTTP for a port-less allowlist entry" {
+    // A port-less entry keeps upstream host-only semantics and never downgrades.
+    const domains = [_][]const u8{"127.0.0.1"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1:8090/api/tasks\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only HTTPS URLs are allowed for security", result.error_msg.?);
+}
+
+test "execute keeps rejecting plain HTTP outside the allowlist" {
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://evil.com/path\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only HTTPS URLs are allowed for security", result.error_msg.?);
+}
+
+test "execute keeps rejecting plain HTTP when no allowlist is configured" {
+    var ht = HttpRequestTool{};
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1:8090/api/tasks\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only HTTPS URLs are allowed for security", result.error_msg.?);
+}
+
+test "execute exempts only http, not every scheme, for a pinned origin" {
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"ftp://127.0.0.1:8090/secret\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only HTTPS URLs are allowed for security", result.error_msg.?);
+}
+
+test "splitPinnedPort reads only a real port suffix" {
+    try std.testing.expectEqualStrings("127.0.0.1", splitPinnedPort("127.0.0.1:8090").?.host);
+    try std.testing.expectEqual(@as(u16, 8090), splitPinnedPort("127.0.0.1:8090").?.port);
+    try std.testing.expectEqualStrings("[::1]", splitPinnedPort("[::1]:8090").?.host);
+    try std.testing.expect(splitPinnedPort("127.0.0.1") == null);
+    try std.testing.expect(splitPinnedPort("[::1]") == null);
+    try std.testing.expect(splitPinnedPort("::1") == null);
+    try std.testing.expect(splitPinnedPort("example.com:not-a-port") == null);
+    try std.testing.expect(splitPinnedPort("example.com:") == null);
 }
 
 test "execute rejects non-allowlisted domain before DNS resolution" {

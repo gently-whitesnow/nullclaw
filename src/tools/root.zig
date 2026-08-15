@@ -552,7 +552,10 @@ pub fn allTools(
         const wft = try allocator.create(web_fetch.WebFetchTool);
         wft.* = .{
             .default_max_chars = tc.web_fetch_max_chars,
-            .allowed_domains = opts.http_allowed_domains,
+            // http_request.allowed_domains is the http_request boundary alone: it names the
+            // private hosts that tool may reach, and reusing it here would silently cut
+            // web_fetch off from the public web. web_fetch stays on SSRF protection.
+            .allowed_domains = &.{},
         };
         try list.append(allocator, wft.tool());
     }
@@ -1059,8 +1062,7 @@ test "all tools wires http and web_search config into tool instances" {
         }
         if (std.mem.eql(u8, t.name(), "web_fetch")) {
             const wft: *web_fetch.WebFetchTool = @ptrCast(@alignCast(t.ptr));
-            try std.testing.expectEqual(@as(usize, 2), wft.allowed_domains.len);
-            try std.testing.expectEqualStrings("example.com", wft.allowed_domains[0]);
+            try std.testing.expectEqual(@as(usize, 0), wft.allowed_domains.len);
             saw_fetch = true;
         }
     }
