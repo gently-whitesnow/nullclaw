@@ -133,7 +133,7 @@ pub const OpenAiCodexProvider = struct {
         const self: *OpenAiCodexProvider = @ptrCast(@alignCast(ptr));
         const token = try self.getValidToken();
 
-        const body = try buildCodexBody(allocator, null, request.messages, normalizeModel(model), request.reasoning_effort);
+        const body = try buildCodexBody(allocator, null, request.messages, request.tools, normalizeModel(model), request.reasoning_effort);
         defer allocator.free(body);
 
         var auth_hdr_buf: [2048]u8 = undefined;
@@ -159,7 +159,7 @@ pub const OpenAiCodexProvider = struct {
         const self: *OpenAiCodexProvider = @ptrCast(@alignCast(ptr));
         const token = try self.getValidToken();
 
-        const body = try buildCodexBody(allocator, null, request.messages, normalizeModel(model), request.reasoning_effort);
+        const body = try buildCodexBody(allocator, null, request.messages, request.tools, normalizeModel(model), request.reasoning_effort);
         defer allocator.free(body);
 
         var auth_hdr_buf: [2048]u8 = undefined;
@@ -169,7 +169,7 @@ pub const OpenAiCodexProvider = struct {
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
-        return false;
+        return true;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
@@ -177,7 +177,7 @@ pub const OpenAiCodexProvider = struct {
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
-        return true;
+        return false;
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -240,6 +240,7 @@ fn buildCodexBody(
     allocator: std.mem.Allocator,
     system: ?[]const u8,
     messages: []const ChatMessage,
+    tools: ?[]const root.ToolSpec,
     model: []const u8,
     reasoning_effort: ?[]const u8,
 ) ![]const u8 {
@@ -294,6 +295,14 @@ fn buildCodexBody(
     try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":\"");
     try buf.appendSlice(allocator, effort);
     try buf.appendSlice(allocator, "\",\"summary\":\"auto\"}");
+
+    if (tools) |tool_specs| {
+        if (tool_specs.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try root.convertToolsResponses(&buf, allocator, tool_specs);
+            try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+        }
+    }
 
     try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);
@@ -1068,7 +1077,7 @@ test "buildCodexBody with system and user messages" {
         .{ .role = .assistant, .content = "Hi there" },
         .{ .role = .user, .content = "How are you?" },
     };
-    const body = try buildCodexBody(std.testing.allocator, null, &messages, "o4-mini", null);
+    const body = try buildCodexBody(std.testing.allocator, null, &messages, null, "o4-mini", null);
     defer std.testing.allocator.free(body);
 
     // Should contain model
@@ -1086,6 +1095,38 @@ test "buildCodexBody with system and user messages" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     // Should contain reasoning
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{") != null);
+}
+
+test "buildCodexBody includes Responses function tools" {
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Read Overtime" },
+    };
+    const tools = [_]root.ToolSpec{
+        .{
+            .name = "shell",
+            .description = "Run overtime-api",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}",
+        },
+    };
+    const body = try buildCodexBody(std.testing.allocator, null, &messages, &tools, "gpt-5.6-sol", "high");
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const tool = parsed.value.object.get("tools").?.array.items[0].object;
+    try std.testing.expectEqualStrings("function", tool.get("type").?.string);
+    try std.testing.expectEqualStrings("shell", tool.get("name").?.string);
+    try std.testing.expectEqualStrings("Run overtime-api", tool.get("description").?.string);
+    try std.testing.expectEqualStrings("auto", parsed.value.object.get("tool_choice").?.string);
+}
+
+test "openai-codex exposes native tools through blocking agent path" {
+    var implementation = OpenAiCodexProvider.init(std.testing.allocator, null);
+    const provider = implementation.provider();
+    defer provider.deinit();
+
+    try std.testing.expect(provider.supportsNativeTools());
+    try std.testing.expect(!provider.supportsStreaming());
 }
 
 test "buildSimpleCodexBody correct JSON" {
@@ -1380,7 +1421,7 @@ test "buildCodexBody with explicit reasoning effort" {
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "Think hard" },
     };
-    const body = try buildCodexBody(std.testing.allocator, null, &messages, "o4-mini", "high");
+    const body = try buildCodexBody(std.testing.allocator, null, &messages, null, "o4-mini", "high");
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
