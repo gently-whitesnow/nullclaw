@@ -489,7 +489,7 @@ pub const ProviderHolder = union(enum) {
                 .{ .gemini_cli = p }
             else |_|
                 .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
-            .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
+            .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, validatedBaseUrl(base_url)) },
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
             .unknown => if (validatedBaseUrl(base_url)) |url| blk: {

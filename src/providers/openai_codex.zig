@@ -37,14 +37,19 @@ pub const OpenAiCodexProvider = struct {
     refresh_token: ?[]const u8,
     account_id: ?[]const u8,
     expires_at: i64,
+    /// Configured `models.providers.openai-codex.base_url`, or the Codex endpoint.
+    /// Upstream accepted the argument and dropped it, which left the Responses path
+    /// unreachable for any offline harness.
+    api_url: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, _: ?[]const u8) OpenAiCodexProvider {
+    pub fn init(allocator: std.mem.Allocator, base_url: ?[]const u8) OpenAiCodexProvider {
         var self = OpenAiCodexProvider{
             .allocator = allocator,
             .access_token = null,
             .refresh_token = null,
             .account_id = null,
             .expires_at = 0,
+            .api_url = base_url orelse CODEX_API_URL,
         };
 
         // Try to load stored credential
@@ -120,7 +125,7 @@ pub const OpenAiCodexProvider = struct {
         var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
-        return codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, 0);
+        return codexRequest(allocator, self.api_url, body, auth_hdr, &.{}, 0);
     }
 
     fn chatImpl(
@@ -139,7 +144,7 @@ pub const OpenAiCodexProvider = struct {
         var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
-        const content = try codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, request.timeout_secs);
+        const content = try codexRequest(allocator, self.api_url, body, auth_hdr, &.{}, request.timeout_secs);
 
         return .{
             .content = content,
@@ -165,7 +170,7 @@ pub const OpenAiCodexProvider = struct {
         var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
-        return codexStreamRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
+        return codexStreamRequest(allocator, self.api_url, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -1118,6 +1123,16 @@ test "buildCodexBody includes Responses function tools" {
     try std.testing.expectEqualStrings("shell", tool.get("name").?.string);
     try std.testing.expectEqualStrings("Run overtime-api", tool.get("description").?.string);
     try std.testing.expectEqualStrings("auto", parsed.value.object.get("tool_choice").?.string);
+}
+
+test "openai-codex targets the configured base_url" {
+    var configured = OpenAiCodexProvider.init(std.testing.allocator, "http://127.0.0.1:1234/codex/responses");
+    defer configured.provider().deinit();
+    try std.testing.expectEqualStrings("http://127.0.0.1:1234/codex/responses", configured.api_url);
+
+    var defaulted = OpenAiCodexProvider.init(std.testing.allocator, null);
+    defer defaulted.provider().deinit();
+    try std.testing.expectEqualStrings(CODEX_API_URL, defaulted.api_url);
 }
 
 test "openai-codex exposes native tools through blocking agent path" {
