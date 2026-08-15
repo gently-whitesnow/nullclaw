@@ -2264,16 +2264,25 @@ pub const SessionManager = struct {
     /// Mark the end of a conversation in the session store before the session
     /// leaves RAM. The transcript itself is never touched: the marker only tells
     /// a later restore where the live context starts.
-    fn markConversationBoundary(session: *Session) void {
-        const store = session.agent.session_store orelse return;
-        if (!hasRestorableConversation(session)) return;
+    ///
+    /// Returns false when the cut could not be persisted and the session still
+    /// holds dialogue: evicting it then would silently restore the whole old
+    /// conversation on the next message, which is exactly the reset this feature
+    /// promises. Such a session stays in RAM until a later eviction pass
+    /// succeeds. Sessions without a store or without dialogue are always
+    /// evictable — there is nothing to cut.
+    fn markConversationBoundary(session: *Session) bool {
+        const store = session.agent.session_store orelse return true;
+        if (!hasRestorableConversation(session)) return true;
         store.saveMessage(
             session.session_key,
             RUNTIME_COMMAND_ROLE,
             memory_mod.SESSION_BOUNDARY_MARKER,
         ) catch |err| {
-            log.warn("failed to persist idle conversation boundary err={}", .{err});
+            log.warn("keeping idle session: failed to persist conversation boundary err={}", .{err});
+            return false;
         };
+        return true;
     }
 
     /// True when the session holds dialogue that a restore would otherwise
@@ -2313,9 +2322,10 @@ pub const SessionManager = struct {
         }
 
         for (to_remove.items) |key| {
+            const candidate = self.sessions.get(key) orelse continue;
+            if (!markConversationBoundary(candidate)) continue;
             if (self.sessions.fetchRemove(key)) |kv| {
                 const session = kv.value;
-                markConversationBoundary(session);
                 session.deinit(self.allocator);
                 self.allocator.destroy(session);
                 evicted += 1;
@@ -5337,6 +5347,165 @@ test "session ttl overrides the global idle timeout and survives the cut" {
 
     const restored = try sm.getOrCreate(ttl_key);
     try testing.expectEqual(@as(?u64, 30), restored.agent.session_ttl_secs);
+    try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
+}
+
+test "session ttl off falls back to the global idle timeout and survives the cut" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const ctx: ConversationContext = .{ .channel = "telegram", .is_group = false, .group_id = null };
+    const session_key = "telegram:main:ttl-off";
+
+    const set_reply = try sm.processMessage(session_key, "/session ttl 30s", ctx);
+    defer testing.allocator.free(set_reply);
+    const turn = try sm.processMessage(session_key, "hello", ctx);
+    defer testing.allocator.free(turn);
+    const off_reply = try sm.processMessage(session_key, "/session ttl off", ctx);
+    defer testing.allocator.free(off_reply);
+    try testing.expect(std.mem.indexOf(u8, off_reply, "global") != null);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(session.agent.session_ttl_secs == null);
+
+    // Without an override the 30s TTL no longer applies, but the global limit does.
+    session.last_active = std_compat.time.timestamp() - 60;
+    try testing.expectEqual(@as(usize, 0), sm.evictIdle(3600));
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    // `off` is persisted after `30s`, so a null TTL here proves it was replayed.
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expect(restored.agent.session_ttl_secs == null);
+    try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
+
+    const status = try restored.agent.handleSlashCommand("/status");
+    defer if (status) |resp| testing.allocator.free(resp);
+    try testing.expect(std.mem.indexOf(u8, status.?, "Session TTL: global") != null);
+}
+
+/// Session store that can be told to reject writes, so the eviction path can be
+/// exercised against a failing transcript backend.
+const FlakySessionStore = struct {
+    inner: memory_mod.SessionStore,
+    fail_saves: bool = false,
+
+    fn implSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
+        const self: *FlakySessionStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_saves) return error.SqliteBusy;
+        return self.inner.saveMessage(session_id, role, content);
+    }
+
+    fn implLoadMessages(ptr: *anyopaque, allocator: Allocator, session_id: []const u8) anyerror![]memory_mod.MessageEntry {
+        const self: *FlakySessionStore = @ptrCast(@alignCast(ptr));
+        return self.inner.loadMessages(allocator, session_id);
+    }
+
+    fn implClearMessages(ptr: *anyopaque, session_id: []const u8) anyerror!void {
+        const self: *FlakySessionStore = @ptrCast(@alignCast(ptr));
+        return self.inner.clearMessages(session_id);
+    }
+
+    fn implClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
+        const self: *FlakySessionStore = @ptrCast(@alignCast(ptr));
+        return self.inner.clearAutoSaved(session_id);
+    }
+
+    fn implSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self: *FlakySessionStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_saves) return error.SqliteBusy;
+        return self.inner.saveUsage(session_id, total_tokens);
+    }
+
+    fn implLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self: *FlakySessionStore = @ptrCast(@alignCast(ptr));
+        return self.inner.loadUsage(session_id);
+    }
+
+    const vtable = memory_mod.SessionStore.VTable{
+        .saveMessage = &implSaveMessage,
+        .loadMessages = &implLoadMessages,
+        .clearMessages = &implClearMessages,
+        .clearAutoSaved = &implClearAutoSaved,
+        .saveUsage = &implSaveUsage,
+        .loadUsage = &implLoadUsage,
+    };
+
+    fn store(self: *FlakySessionStore) memory_mod.SessionStore {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+test "idle eviction keeps the session when the conversation cut cannot be persisted" {
+    // Regression: dropping the session after a failed boundary write would
+    // restore the whole old conversation on the next message — the exact reset
+    // this feature promises, silently skipped on a store error.
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var flaky = FlakySessionStore{ .inner = sqlite_mem.sessionStore() };
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        flaky.store(),
+        null,
+    );
+    defer sm.deinit();
+
+    const ctx: ConversationContext = .{ .channel = "telegram", .is_group = false, .group_id = null };
+    const session_key = "telegram:main:boundary-failure";
+
+    const turn = try sm.processMessage(session_key, "alpha question", ctx);
+    defer testing.allocator.free(turn);
+
+    const session = try sm.getOrCreate(session_key);
+    session.last_active = 0;
+
+    flaky.fail_saves = true;
+    try testing.expectEqual(@as(usize, 0), sm.evictIdle(1));
+    try testing.expect(sm.sessions.get(session_key) != null);
+
+    const kept = try sqlite_mem.sessionStore().loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, kept);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqualStrings("alpha question", kept[0].content);
+
+    flaky.fail_saves = false;
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const cut = try sqlite_mem.sessionStore().loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, cut);
+    try testing.expectEqual(@as(usize, 3), cut.len);
+    try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, cut[2].role);
+    try testing.expectEqualStrings(memory_mod.SESSION_BOUNDARY_MARKER, cut[2].content);
+
+    const restored = try sm.getOrCreate(session_key);
     try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
 }
 

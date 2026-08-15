@@ -3549,7 +3549,7 @@ fn formatStatus(self: anytype) ![]const u8 {
     if (self.session_ttl_secs) |ttl| {
         try w.print("{s}: {d}s\n", .{ ttl_label, ttl });
     } else {
-        try w.print("{s}: off\n", .{ttl_label});
+        try w.print("{s}: {s}\n", .{ ttl_label, SESSION_TTL_GLOBAL_LABEL });
     }
     if (findSubagentManager(self)) |manager| {
         manager.mutex.lock();
@@ -3948,22 +3948,26 @@ fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(self.allocator, "Session exported to: {s}", .{path});
 }
 
+const SESSION_TTL_GLOBAL_LABEL = "global";
+
 /// `/session ttl` overrides `agent.session_idle_timeout_secs` for this session
 /// only. On expiry the session leaves RAM and its conversation is cut; the
 /// stored transcript stays readable.
 fn handleSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     var it = std.mem.tokenizeAny(u8, arg, " \t");
-    const sub = it.next() orelse return try std.fmt.allocPrint(self.allocator, "Session TTL: {s}", .{if (self.session_ttl_secs) |_| "set" else "off"});
+    // Without an override the global idle timeout still expires the session, so
+    // the state reads "global" — "off" would promise an immortal session.
+    const sub = it.next() orelse return try std.fmt.allocPrint(self.allocator, "Session TTL: {s}", .{if (self.session_ttl_secs) |_| "set" else SESSION_TTL_GLOBAL_LABEL});
     if (std.ascii.eqlIgnoreCase(sub, "ttl")) {
         const ttl = it.next() orelse {
             if (self.session_ttl_secs) |v| {
                 return try std.fmt.allocPrint(self.allocator, "Session TTL: {d}s", .{v});
             }
-            return try self.allocator.dupe(u8, "Session TTL: off");
+            return try self.allocator.dupe(u8, "Session TTL: " ++ SESSION_TTL_GLOBAL_LABEL);
         };
         if (std.ascii.eqlIgnoreCase(ttl, "off")) {
             self.session_ttl_secs = null;
-            return try self.allocator.dupe(u8, "Session TTL cleared: using the global idle timeout.");
+            return try self.allocator.dupe(u8, "Session TTL: " ++ SESSION_TTL_GLOBAL_LABEL ++ " (idle timeout from config).");
         }
         self.session_ttl_secs = parseDurationSeconds(ttl) orelse
             return try self.allocator.dupe(u8, "Invalid TTL duration.");
