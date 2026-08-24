@@ -94,6 +94,7 @@ pub fn runTaskWithTools(
     const tools = try tools_mod.subagentTools(allocator, request.workspace_dir, .{
         .http_enabled = request.http_enabled,
         .http_allowed_domains = request.http_allowed_domains,
+        .http_deny_all = request.http_deny_all,
         .http_max_response_size = request.http_max_response_size,
         .http_timeout_secs = request.http_timeout_secs,
         .allowed_paths = request.allowed_paths,

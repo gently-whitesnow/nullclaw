@@ -1254,11 +1254,11 @@ pub const SessionManager = struct {
             if (cfg.workspace_path) |workspace_path| {
                 return self.config.resolveAgentWorkspacePath(self.allocator, workspace_path);
             }
-            if (cfg.http_request_allowed_domains != null) {
-                return self.allocator.dupe(u8, self.config.workspace_dir);
-            }
         }
 
+        if (!(self.config.session.auto_provision_direct_agents and std.mem.startsWith(u8, agent_id, "peer-"))) {
+            return self.allocator.dupe(u8, self.config.workspace_dir);
+        }
         const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse ".";
         const normalized = try sanitizePathComponent(self.allocator, agent_id);
         defer self.allocator.free(normalized);
@@ -2832,12 +2832,16 @@ fn testSessionManager(allocator: Allocator, mock: *MockProvider, cfg: *const Con
 }
 
 fn testSessionManagerWithMemory(allocator: Allocator, mock: *MockProvider, cfg: *const Config, mem: ?Memory, session_store: ?memory_mod.SessionStore) SessionManager {
+    return testSessionManagerWithToolsAndMemory(allocator, mock, cfg, &.{}, mem, session_store);
+}
+
+fn testSessionManagerWithToolsAndMemory(allocator: Allocator, mock: *MockProvider, cfg: *const Config, tools: []const Tool, mem: ?Memory, session_store: ?memory_mod.SessionStore) SessionManager {
     var noop = observability.NoopObserver{};
     return SessionManager.init(
         allocator,
         cfg,
         mock.provider(),
-        &.{},
+        tools,
         mem,
         noop.observer(),
         session_store,
@@ -3465,6 +3469,12 @@ test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {
     cfg.workspace_dir = base;
     cfg.config_path = config_path;
     cfg.session.auto_provision_direct_agents = true;
+    cfg.agents = &.{.{
+        .name = "peer-deadbeefcafebabe",
+        .provider = "openrouter",
+        .model = "test/mock-model",
+        .http_request_allowed_domains = &.{"127.0.0.1:8090"},
+    }};
 
     var mock = MockProvider{ .response = "ok" };
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
@@ -3555,7 +3565,12 @@ test "telegram peer routes receive isolated named agent http policies" {
     cfg.agent_bindings = &bindings;
 
     var mock = MockProvider{ .response = "ok" };
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    const root_tools = try tools_mod.allTools(testing.allocator, base, .{
+        .http_enabled = true,
+        .http_allowed_domains = &origins,
+    });
+    defer tools_mod.deinitTools(testing.allocator, root_tools);
+    var sm = testSessionManagerWithToolsAndMemory(testing.allocator, &mock, &cfg, root_tools, null, null);
     defer sm.deinit();
 
     const TestRoute = struct {
@@ -3612,7 +3627,9 @@ test "telegram peer routes receive isolated named agent http policies" {
     defer testing.allocator.free(unknown_route.main_session_key);
     try testing.expectEqualStrings("missing", unknown_route.agent_id);
     const unknown_session = try sm.getOrCreate(unknown_route.session_key);
-    try testing.expectEqual(@as(usize, 0), unknown_session.agent.tools.len);
+    const unknown_http = try TestRoute.httpTool(unknown_session);
+    try testing.expectEqual(@as(usize, 2), unknown_http.allowed_domains.len);
+    try testing.expect(!unknown_http.deny_all);
     try testing.expectEqual(@as(usize, 3), sm.agent_runtimes.count());
 }
 

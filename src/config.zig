@@ -1626,15 +1626,17 @@ pub const Config = struct {
                 return ValidationError.UnknownAgentProvider;
             }
             if (agent_cfg.http_request_allowed_domains) |allowed_domains| {
-                for (allowed_domains) |domain| {
-                    var inherited = false;
-                    for (self.http_request.allowed_domains) |global_domain| {
-                        if (std.mem.eql(u8, domain, global_domain)) {
-                            inherited = true;
-                            break;
+                if (self.http_request.allowed_domains.len > 0) {
+                    for (allowed_domains) |domain| {
+                        var inherited = false;
+                        for (self.http_request.allowed_domains) |global_domain| {
+                            if (std.mem.eql(u8, domain, global_domain)) {
+                                inherited = true;
+                                break;
+                            }
                         }
+                        if (!inherited) return ValidationError.AgentHttpAllowlistExpandsGlobal;
                     }
-                    if (!inherited) return ValidationError.AgentHttpAllowlistExpandsGlobal;
                 }
             }
         }
@@ -2670,6 +2672,12 @@ test "save roundtrip preserves extended config sections" {
             .http_request_allowed_domains = &.{"127.0.0.1:8090"},
             .enable_pii_redaction = false,
         },
+        .{
+            .name = "offline",
+            .provider = "openrouter",
+            .model = "openai/gpt-4o-mini",
+            .http_request_allowed_domains = &.{},
+        },
     };
     cfg.agent_bindings = &.{
         .{
@@ -2842,11 +2850,13 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(usize, 1), loaded.model_routes.len);
     try std.testing.expectEqualStrings("fast", loaded.model_routes[0].hint);
     try std.testing.expectEqualStrings("gsk_test", loaded.model_routes[0].api_key.?);
-    try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.agents.len);
     try std.testing.expectEqualStrings("helper", loaded.agents[0].name);
     try std.testing.expectEqual(@as(usize, 1), loaded.agents[0].http_request_allowed_domains.?.len);
     try std.testing.expectEqualStrings("127.0.0.1:8090", loaded.agents[0].http_request_allowed_domains.?[0]);
     try std.testing.expect(!loaded.agents[0].enable_pii_redaction);
+    try std.testing.expect(loaded.agents[1].http_request_allowed_domains != null);
+    try std.testing.expectEqual(@as(usize, 0), loaded.agents[1].http_request_allowed_domains.?.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.agent_bindings.len);
     try std.testing.expectEqualStrings("discord", loaded.agent_bindings[0].match.channel.?);
     try std.testing.expectEqualStrings("main", loaded.agent_bindings[0].match.account_id.?);
@@ -5334,6 +5344,9 @@ test "validation rejects named agent http allowlist expansion" {
     }};
 
     try std.testing.expectError(Config.ValidationError.AgentHttpAllowlistExpandsGlobal, cfg.validate());
+
+    cfg.http_request.allowed_domains = &.{};
+    try cfg.validate();
 
     cfg.agents = &.{.{
         .name = "deny",

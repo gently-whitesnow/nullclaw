@@ -4258,11 +4258,22 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8, agent_n
         return try self.allocator.dupe(u8, SUBAGENTS_SPAWN_USAGE);
     }
 
-    const manager = findSubagentManager(self) orelse
+    const spawn_tool = findSpawnTool(self) orelse
+        return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
+    const manager = spawn_tool.manager orelse
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
     const route = resolveSubagentOriginRoute(self);
-    const task_id = manager.spawnWithAgent(trimmed_task, label, route.channel, route.chat_id, route.account_id, route.session_key, agent_name) catch |err| {
+    const task_id = manager.spawnWithAgent(
+        trimmed_task,
+        label,
+        route.channel,
+        route.chat_id,
+        route.account_id,
+        route.session_key,
+        agent_name,
+        .{ .allowed_domains = spawn_tool.http_allowed_domains, .deny_all = spawn_tool.http_deny_all },
+    ) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
             error.UnknownAgent => if (agent_name) |name|

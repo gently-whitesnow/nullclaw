@@ -64,6 +64,7 @@ pub const TaskRunRequest = struct {
     allowed_paths: []const []const u8,
     http_enabled: bool,
     http_allowed_domains: []const []const u8,
+    http_deny_all: bool,
     http_max_response_size: u32,
     http_timeout_secs: u64,
     tools_config: config_types.ToolsConfig,
@@ -81,6 +82,11 @@ pub const TaskRunRequest = struct {
     observer: ?observability.Observer = null,
 };
 
+pub const HttpPolicy = struct {
+    allowed_domains: []const []const u8,
+    deny_all: bool = false,
+};
+
 pub const TaskRunnerFn = *const fn (allocator: Allocator, request: TaskRunRequest) anyerror![]const u8;
 
 // ── ThreadContext — passed to each spawned thread ────────────────
@@ -91,6 +97,7 @@ const ThreadContext = struct {
     task: []const u8,
     label: []const u8,
     agent_name: ?[]const u8 = null,
+    http_policy: HttpPolicy,
     trace_id: ?[32]u8 = null,
 };
 
@@ -198,11 +205,11 @@ pub const SubagentManager = struct {
         origin_account_id: ?[]const u8,
         origin_session_key: []const u8,
     ) !u64 {
-        return self.spawnWithAgent(task, label, origin_channel, origin_chat_id, origin_account_id, origin_session_key, null);
+        return self.spawnWithAgent(task, label, origin_channel, origin_chat_id, origin_account_id, origin_session_key, null, null);
     }
 
     /// Spawn a background subagent using an optional named agent profile.
-    /// When `agent_name` is set, provider/model/prompt are resolved from `agents.list`.
+    /// The caller's HTTP policy remains the upper bound when a profile is selected.
     pub fn spawnWithAgent(
         self: *SubagentManager,
         task: []const u8,
@@ -212,6 +219,7 @@ pub const SubagentManager = struct {
         origin_account_id: ?[]const u8,
         origin_session_key: []const u8,
         agent_name: ?[]const u8,
+        caller_http_policy: ?HttpPolicy,
     ) !u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -269,6 +277,7 @@ pub const SubagentManager = struct {
             .task = task_copy,
             .label = label_copy,
             .agent_name = agent_name_copy,
+            .http_policy = caller_http_policy orelse .{ .allowed_domains = self.http_allowed_domains },
             .trace_id = trace_id,
         };
 
@@ -575,6 +584,9 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     var temperature: f64 = 0.7;
     var explicit_api_key: ?[]const u8 = null;
     var effective_workspace = ctx.manager.workspace_dir;
+    var effective_http_policy = ctx.http_policy;
+    var owned_http_domains: ?[][]const u8 = null;
+    defer if (owned_http_domains) |domains| ctx.manager.allocator.free(domains);
     var resolved_workspace: ?[]const u8 = null;
     defer if (resolved_workspace) |workspace_dir| ctx.manager.allocator.free(workspace_dir);
 
@@ -589,6 +601,34 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         explicit_api_key = agent_cfg.api_key;
         if (agent_cfg.system_prompt) |sp| system_prompt = sp;
         if (agent_cfg.temperature) |t| temperature = t;
+        if (agent_cfg.http_request_allowed_domains) |agent_domains| {
+            if (effective_http_policy.deny_all or agent_domains.len == 0) {
+                effective_http_policy = .{ .allowed_domains = &.{}, .deny_all = true };
+            } else if (effective_http_policy.allowed_domains.len == 0) {
+                effective_http_policy.allowed_domains = agent_domains;
+            } else {
+                var intersection: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer intersection.deinit(ctx.manager.allocator);
+                for (effective_http_policy.allowed_domains) |caller_domain| {
+                    for (agent_domains) |agent_domain| {
+                        if (!std.mem.eql(u8, caller_domain, agent_domain)) continue;
+                        intersection.append(ctx.manager.allocator, caller_domain) catch {
+                            ctx.manager.completeTask(ctx.task_id, null, "OutOfMemory");
+                            return;
+                        };
+                        break;
+                    }
+                }
+                owned_http_domains = intersection.toOwnedSlice(ctx.manager.allocator) catch {
+                    ctx.manager.completeTask(ctx.task_id, null, "OutOfMemory");
+                    return;
+                };
+                effective_http_policy = .{
+                    .allowed_domains = owned_http_domains.?,
+                    .deny_all = owned_http_domains.?.len == 0,
+                };
+            }
+        }
         if (agent_cfg.workspace_path) |workspace_path| {
             resolved_workspace = resolveWorkspacePath(
                 ctx.manager.allocator,
@@ -617,7 +657,8 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .workspace_dir = effective_workspace,
             .allowed_paths = ctx.manager.allowed_paths,
             .http_enabled = ctx.manager.http_enabled,
-            .http_allowed_domains = ctx.manager.http_allowed_domains,
+            .http_allowed_domains = effective_http_policy.allowed_domains,
+            .http_deny_all = effective_http_policy.deny_all,
             .http_max_response_size = ctx.manager.http_max_response_size,
             .http_timeout_secs = ctx.manager.http_timeout_secs,
             .tools_config = ctx.manager.tools_config,
@@ -762,6 +803,11 @@ fn testTaskRunnerWorkspaceAndPrompt(allocator: Allocator, request: TaskRunReques
 
 fn testTaskRunnerHttpTimeout(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{request.http_timeout_secs});
+}
+
+fn testTaskRunnerHttpPolicy(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
+    if (request.http_deny_all) return allocator.dupe(u8, "deny-all");
+    return std.mem.join(allocator, ",", request.http_allowed_domains);
 }
 
 fn testTaskRunnerFail(_: Allocator, _: TaskRunRequest) ![]const u8 {
@@ -1095,7 +1141,7 @@ test "SubagentManager spawnWithAgent rejects unknown agent" {
 
     try std.testing.expectError(
         error.UnknownAgent,
-        mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", null, "session:42", "missing-agent"),
+        mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", null, "session:42", "missing-agent", null),
     );
 }
 
@@ -1114,8 +1160,75 @@ test "SubagentManager spawnWithAgent accepts configured agent" {
     var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer mgr.deinit();
 
-    const task_id = try mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", null, "session:42", "researcher");
+    const task_id = try mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", null, "session:42", "researcher", null);
     try std.testing.expect(task_id > 0);
+}
+
+test "SubagentManager keeps caller http policy when spawning a named agent" {
+    const global_origins = [_][]const u8{ "127.0.0.1:8090", "127.0.0.1:8091" };
+    const agents = [_]config_mod.NamedAgentConfig{
+        .{
+            .name = "first",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .http_request_allowed_domains = global_origins[0..1],
+        },
+        .{
+            .name = "second",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .http_request_allowed_domains = global_origins[1..2],
+        },
+    };
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .agents = &agents,
+        .http_request = .{ .enabled = true, .allowed_domains = &global_origins },
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.task_runner = testTaskRunnerHttpPolicy;
+    defer mgr.deinit();
+
+    const narrowed_task = try mgr.spawnWithAgent(
+        "task",
+        "narrowed",
+        "agent",
+        "session:1",
+        null,
+        "session:1",
+        "first",
+        .{ .allowed_domains = global_origins[0..1] },
+    );
+    try std.testing.expectEqual(TaskStatus.completed, try waitTaskTerminalStatus(&mgr, narrowed_task));
+    try std.testing.expectEqualStrings("127.0.0.1:8090", mgr.getTaskResult(narrowed_task).?);
+
+    const intersected_task = try mgr.spawnWithAgent(
+        "task",
+        "intersected",
+        "agent",
+        "session:1",
+        null,
+        "session:1",
+        "second",
+        .{ .allowed_domains = global_origins[0..1] },
+    );
+    try std.testing.expectEqual(TaskStatus.completed, try waitTaskTerminalStatus(&mgr, intersected_task));
+    try std.testing.expectEqualStrings("deny-all", mgr.getTaskResult(intersected_task).?);
+
+    const denied_task = try mgr.spawnWithAgent(
+        "task",
+        "denied",
+        "agent",
+        "session:1",
+        null,
+        "session:1",
+        null,
+        .{ .allowed_domains = &.{}, .deny_all = true },
+    );
+    try std.testing.expectEqual(TaskStatus.completed, try waitTaskTerminalStatus(&mgr, denied_task));
+    try std.testing.expectEqualStrings("deny-all", mgr.getTaskResult(denied_task).?);
 }
 
 test "SubagentManager uses named agent workspace_path for task runner" {
@@ -1145,7 +1258,7 @@ test "SubagentManager uses named agent workspace_path for task runner" {
     mgr.task_runner = testTaskRunnerWorkspace;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawnWithAgent("quick task", "workspace-check", "agent", "session:42", null, "session:42", "researcher");
+    const task_id = try mgr.spawnWithAgent("quick task", "workspace-check", "agent", "session:42", null, "session:42", "researcher", null);
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
     try std.testing.expectEqualStrings(expected_workspace, mgr.getTaskResult(task_id).?);
@@ -1180,7 +1293,7 @@ test "SubagentManager preserves named agent system_prompt when workspace_path is
     mgr.task_runner = testTaskRunnerWorkspaceAndPrompt;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawnWithAgent("quick task", "workspace-prompt-check", "agent", "session:42", null, "session:42", "researcher");
+    const task_id = try mgr.spawnWithAgent("quick task", "workspace-prompt-check", "agent", "session:42", null, "session:42", "researcher", null);
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
 

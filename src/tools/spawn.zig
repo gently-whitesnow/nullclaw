@@ -13,6 +13,8 @@ pub const SpawnTool = struct {
     default_account_id: ?[]const u8 = null,
     default_chat_id: ?[]const u8 = null,
     default_session_key: ?[]const u8 = null,
+    http_allowed_domains: []const []const u8 = &.{},
+    http_deny_all: bool = false,
 
     pub const tool_name = "spawn";
     pub const tool_description = "Spawn a background subagent to work on a task asynchronously. Returns a task ID immediately. Results are delivered as follow-up messages when complete.";
@@ -55,7 +57,16 @@ pub const SpawnTool = struct {
         const chat_id = self.default_chat_id orelse "agent";
         const session_key = self.default_session_key orelse chat_id;
 
-        const task_id = manager.spawnWithAgent(trimmed_task, label, channel, chat_id, account_id, session_key, agent_name) catch |err| {
+        const task_id = manager.spawnWithAgent(
+            trimmed_task,
+            label,
+            channel,
+            chat_id,
+            account_id,
+            session_key,
+            agent_name,
+            .{ .allowed_domains = self.http_allowed_domains, .deny_all = self.http_deny_all },
+        ) catch |err| {
             return switch (err) {
                 error.TooManyConcurrentSubagents => ToolResult.fail("Too many concurrent subagents. Wait for some to complete."),
                 error.UnknownAgent => ToolResult.fail("Unknown named agent profile"),

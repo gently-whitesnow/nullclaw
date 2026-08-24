@@ -524,7 +524,11 @@ pub fn allTools(
 
     // Spawn tool (async subagent)
     const sp = try allocator.create(spawn.SpawnTool);
-    sp.* = .{ .manager = opts.subagent_manager };
+    sp.* = .{
+        .manager = opts.subagent_manager,
+        .http_allowed_domains = opts.http_allowed_domains,
+        .http_deny_all = opts.http_deny_all,
+    };
     try list.append(allocator, sp.tool());
 
     if (opts.http_enabled) {
@@ -674,6 +678,7 @@ pub fn subagentTools(
     opts: struct {
         http_enabled: bool = false,
         http_allowed_domains: []const []const u8 = &.{},
+        http_deny_all: bool = false,
         http_max_response_size: u32 = 1_000_000,
         http_timeout_secs: u64 = 30,
         allowed_paths: []const []const u8 = &.{},
@@ -776,6 +781,7 @@ pub fn subagentTools(
         const ht = try allocator.create(http_request.HttpRequestTool);
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
+            .deny_all = opts.http_deny_all,
             .max_response_size = opts.http_max_response_size,
             .timeout_secs = opts.http_timeout_secs,
         };
@@ -1149,8 +1155,11 @@ test "all tools wires subagent manager into spawn tool" {
     var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
 
+    const domains = [_][]const u8{"127.0.0.1:8090"};
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .subagent_manager = &manager,
+        .http_allowed_domains = &domains,
+        .http_deny_all = true,
     });
     defer deinitTools(std.testing.allocator, tools);
 
@@ -1159,6 +1168,8 @@ test "all tools wires subagent manager into spawn tool" {
         if (!std.mem.eql(u8, t.name(), "spawn")) continue;
         const spawn_tool: *spawn.SpawnTool = @ptrCast(@alignCast(t.ptr));
         try std.testing.expect(spawn_tool.manager == &manager);
+        try std.testing.expectEqualStrings("127.0.0.1:8090", spawn_tool.http_allowed_domains[0]);
+        try std.testing.expect(spawn_tool.http_deny_all);
         checked_spawn = true;
         break;
     }
@@ -1298,6 +1309,7 @@ test "subagent tools wire http allowlist, response limit, and timeout" {
     const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
         .http_enabled = true,
         .http_allowed_domains = &domains,
+        .http_deny_all = true,
         .http_max_response_size = 2222,
         .http_timeout_secs = 17,
     });
@@ -1309,6 +1321,7 @@ test "subagent tools wire http allowlist, response limit, and timeout" {
         const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
         try std.testing.expectEqual(@as(usize, 1), ht.allowed_domains.len);
         try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+        try std.testing.expect(ht.deny_all);
         try std.testing.expectEqual(@as(u32, 2222), ht.max_response_size);
         try std.testing.expectEqual(@as(u64, 17), ht.timeout_secs);
         saw_http = true;

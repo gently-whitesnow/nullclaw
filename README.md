@@ -610,7 +610,9 @@ A named agent may narrow the global `http_request.allowed_domains` policy:
 }
 ```
 
-Every per-agent entry must also appear in the global list, so a profile cannot expand network access. Omitting the per-agent field inherits the global policy; an explicit empty list denies all `http_request` origins for that agent.
+When the global list is non-empty, every per-agent entry must also appear in it, so a profile cannot expand network access. An empty global list keeps its existing allow-all meaning and may still be narrowed by a named agent. Omitting the per-agent field inherits the global policy; an explicit empty list denies all `http_request` origins for that agent. Spawned subagents inherit the caller's boundary and intersect it with any explicitly selected named profile.
+
+This policy applies only to the `http_request` tool. It does not constrain network-capable shell commands or the browser tool; deployments that use it as an agent boundary must keep `autonomy.block_medium_risk_commands` enabled and `browser.enabled` disabled, or secure those surfaces separately.
 
 Minimal end-to-end example:
 

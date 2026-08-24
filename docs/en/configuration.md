@@ -288,10 +288,12 @@ A named agent can restrict `http_request` to a subset of the global `http_reques
 }
 ```
 
-- Every per-agent entry must exactly match an entry in the global list.
+- When the global list is non-empty, every per-agent entry must exactly match an entry in it. An empty global list retains its allow-all meaning and may still be narrowed per agent.
 - Omitting the field inherits the global policy.
 - An explicit empty list denies every `http_request` origin for that agent.
 - Routed sessions select the named agent before their tool inventory is created, so one agent cannot use another agent's allowed origin.
+- Spawned subagents inherit the caller's boundary; selecting another named profile can only narrow it further.
+- The boundary covers only `http_request`, not network-capable shell commands or the browser tool. Keep `autonomy.block_medium_risk_commands` enabled and `browser.enabled` disabled when relying on this boundary, or secure those surfaces separately.
 
 #### `agents.list[].workspace_path`
 
