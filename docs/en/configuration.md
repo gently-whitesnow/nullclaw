@@ -266,6 +266,33 @@ Notes:
 - Prefer short stable ids (`coder`, `researcher`) so chat commands stay simple.
 - Keep specialist prompts narrow; broad prompts overlap and reduce routing clarity.
 
+#### `agents.list[].http_request.allowed_domains`
+
+A named agent can restrict `http_request` to a subset of the global `http_request.allowed_domains` list:
+
+```json
+{
+  "http_request": {
+    "enabled": true,
+    "allowed_domains": ["127.0.0.1:8090", "127.0.0.1:8091"]
+  },
+  "agents": {
+    "list": [
+      {
+        "id": "first",
+        "model": { "primary": "openrouter/anthropic/claude-sonnet-4" },
+        "http_request": { "allowed_domains": ["127.0.0.1:8090"] }
+      }
+    ]
+  }
+}
+```
+
+- Every per-agent entry must exactly match an entry in the global list.
+- Omitting the field inherits the global policy.
+- An explicit empty list denies every `http_request` origin for that agent.
+- Routed sessions select the named agent before their tool inventory is created, so one agent cannot use another agent's allowed origin.
+
 #### `agents.list[].workspace_path`
 
 Use `workspace_path` when a named agent should run from its own workspace instead of the global one.

@@ -1832,6 +1832,8 @@ pub const NamedAgentConfig = struct {
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+    /// Null inherits the global policy; an explicit empty list denies every origin.
+    http_request_allowed_domains: ?[]const []const u8 = null,
     /// Redact PII (email, phone, card+Luhn, passport-anchored ID, tokens) in
     /// outbound provider messages so user data does not leak to remote LLMs.
     /// Default true (secure-by-default). Disable explicitly for known-local-only agents.

@@ -15,6 +15,7 @@ const log = std.log.scoped(.http_request);
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    deny_all: bool = false,
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 60,
 
@@ -39,6 +40,10 @@ pub const HttpRequestTool = struct {
             return ToolResult.fail("Missing 'url' parameter");
 
         const method_str = root.getString(args, "method") orelse "GET";
+
+        if (self.deny_all) {
+            return ToolResult.fail("Host is not in http_request.allowed_domains");
+        }
 
         // Validate method first (cheap local operation, no network calls)
         const method = validateMethod(method_str) orelse {
@@ -870,6 +875,16 @@ test "execute rejects non-allowlisted domain" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "allowed_domains") != null);
+}
+
+test "execute explicit deny all rejects before network" {
+    var ht = HttpRequestTool{ .deny_all = true };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"https://example.com/path\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
 }
 
 // ── Allowlist SSRF bypass tests (Issue #393) ───────────────

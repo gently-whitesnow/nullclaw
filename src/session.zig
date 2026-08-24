@@ -1234,7 +1234,7 @@ pub const SessionManager = struct {
 
     fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
         if (named_agent) |cfg| {
-            if (cfg.workspace_path != null) return true;
+            if (cfg.workspace_path != null or cfg.http_request_allowed_domains != null) return true;
         }
         return self.config.session.auto_provision_direct_agents and std.mem.startsWith(u8, agent_id, "peer-");
     }
@@ -1253,6 +1253,9 @@ pub const SessionManager = struct {
         if (named_agent) |cfg| {
             if (cfg.workspace_path) |workspace_path| {
                 return self.config.resolveAgentWorkspacePath(self.allocator, workspace_path);
+            }
+            if (cfg.http_request_allowed_domains != null) {
+                return self.allocator.dupe(u8, self.config.workspace_dir);
             }
         }
 
@@ -1308,7 +1311,14 @@ pub const SessionManager = struct {
 
         const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
             .http_enabled = self.config.http_request.enabled,
-            .http_allowed_domains = self.config.http_request.allowed_domains,
+            .http_allowed_domains = if (named_agent) |agent_cfg|
+                agent_cfg.http_request_allowed_domains orelse self.config.http_request.allowed_domains
+            else
+                self.config.http_request.allowed_domains,
+            .http_deny_all = if (named_agent) |agent_cfg|
+                if (agent_cfg.http_request_allowed_domains) |allowed_domains| allowed_domains.len == 0 else false
+            else
+                false,
             .http_max_response_size = self.config.http_request.max_response_size,
             .http_timeout_secs = self.config.http_request.timeout_secs,
             .web_search_base_url = self.config.http_request.search_base_url,
@@ -3499,6 +3509,111 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     const session = try sm.getOrCreate("agent:helper-bot:telegram:direct:42");
     try expectPathEndsWith(session.agent.workspace_dir, "agents/helper-workspace");
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "telegram peer routes receive isolated named agent http policies" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    const origins = [_][]const u8{ "127.0.0.1:8090", "127.0.0.1:8091" };
+    const agents = [_]NamedAgentConfig{
+        .{
+            .name = "first",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+            .http_request_allowed_domains = origins[0..1],
+        },
+        .{
+            .name = "second",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+            .http_request_allowed_domains = origins[1..2],
+        },
+        .{
+            .name = "deny",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+            .http_request_allowed_domains = &.{},
+        },
+    };
+    const bindings = [_]agent_routing.AgentBinding{
+        .{ .agent_id = "first", .match = .{ .channel = "telegram", .peer = .{ .kind = .direct, .id = "peer-1" } } },
+        .{ .agent_id = "second", .match = .{ .channel = "telegram", .peer = .{ .kind = .direct, .id = "peer-2" } } },
+        .{ .agent_id = "deny", .match = .{ .channel = "telegram", .peer = .{ .kind = .direct, .id = "peer-3" } } },
+        .{ .agent_id = "missing", .match = .{ .channel = "telegram", .peer = .{ .kind = .direct, .id = "peer-4" } } },
+    };
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.http_request.enabled = true;
+    cfg.http_request.allowed_domains = &origins;
+    cfg.agents = &agents;
+    cfg.agent_bindings = &bindings;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const TestRoute = struct {
+        fn resolve(allocator: Allocator, config: *const Config, peer_id: []const u8) !agent_routing.ResolvedRoute {
+            return agent_routing.resolveRouteWithSession(allocator, .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .direct, .id = peer_id },
+            }, config.agent_bindings, config.agents, config.session);
+        }
+
+        fn httpTool(session: *Session) !*tools_mod.http_request.HttpRequestTool {
+            for (session.agent.tools) |tool| {
+                if (std.mem.eql(u8, tool.name(), "http_request")) {
+                    return @ptrCast(@alignCast(tool.ptr));
+                }
+            }
+            return error.TestExpectedEqual;
+        }
+    };
+
+    const first_route = try TestRoute.resolve(testing.allocator, &cfg, "peer-1");
+    defer testing.allocator.free(first_route.session_key);
+    defer testing.allocator.free(first_route.main_session_key);
+    try testing.expectEqualStrings("first", first_route.agent_id);
+    const first_session = try sm.getOrCreate(first_route.session_key);
+    const first_http = try TestRoute.httpTool(first_session);
+    try testing.expectEqualStrings("127.0.0.1:8090", first_http.allowed_domains[0]);
+
+    const own_args = try tools_mod.parseTestArgs("{\"url\":\"https://127.0.0.1:8090/api/tasks\"}");
+    defer own_args.deinit();
+    const own_result = try first_http.tool().execute(testing.allocator, own_args.value.object);
+    try testing.expectEqualStrings("Network disabled in tests", own_result.error_msg.?);
+
+    const cross_args = try tools_mod.parseTestArgs("{\"url\":\"https://127.0.0.1:8091/api/tasks\"}");
+    defer cross_args.deinit();
+    const cross_result = try first_http.tool().execute(testing.allocator, cross_args.value.object);
+    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", cross_result.error_msg.?);
+
+    const second_route = try TestRoute.resolve(testing.allocator, &cfg, "peer-2");
+    defer testing.allocator.free(second_route.session_key);
+    defer testing.allocator.free(second_route.main_session_key);
+    const second_http = try TestRoute.httpTool(try sm.getOrCreate(second_route.session_key));
+    try testing.expectEqualStrings("127.0.0.1:8091", second_http.allowed_domains[0]);
+
+    const deny_route = try TestRoute.resolve(testing.allocator, &cfg, "peer-3");
+    defer testing.allocator.free(deny_route.session_key);
+    defer testing.allocator.free(deny_route.main_session_key);
+    const deny_http = try TestRoute.httpTool(try sm.getOrCreate(deny_route.session_key));
+    try testing.expect(deny_http.deny_all);
+
+    const unknown_route = try TestRoute.resolve(testing.allocator, &cfg, "peer-4");
+    defer testing.allocator.free(unknown_route.session_key);
+    defer testing.allocator.free(unknown_route.main_session_key);
+    try testing.expectEqualStrings("missing", unknown_route.agent_id);
+    const unknown_session = try sm.getOrCreate(unknown_route.session_key);
+    try testing.expectEqual(@as(usize, 0), unknown_session.agent.tools.len);
+    try testing.expectEqual(@as(usize, 3), sm.agent_runtimes.count());
 }
 
 test "handleLocalSlashCommand activates interactive skill session" {

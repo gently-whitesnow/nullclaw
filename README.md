@@ -589,6 +589,29 @@ Relative paths are resolved from the directory that contains `config.json`, the 
 Setting `workspace_path` does not disable `system_prompt`: when both are configured, the named profile prompt is still applied and the workspace bootstrap files are loaded from that dedicated workspace.
 This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
 
+A named agent may narrow the global `http_request.allowed_domains` policy:
+
+```json
+{
+  "http_request": {
+    "enabled": true,
+    "allowed_domains": ["127.0.0.1:8090", "127.0.0.1:8091"]
+  },
+  "agents": {
+    "list": [
+      {
+        "id": "first",
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4",
+        "http_request": { "allowed_domains": ["127.0.0.1:8090"] }
+      }
+    ]
+  }
+}
+```
+
+Every per-agent entry must also appear in the global list, so a profile cannot expand network access. Omitting the per-agent field inherits the global policy; an explicit empty list denies all `http_request` origins for that agent.
+
 Minimal end-to-end example:
 
 ```json

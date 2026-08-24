@@ -155,6 +155,9 @@ const SerializedNamedAgentConfig = struct {
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+    http_request: ?struct {
+        allowed_domains: []const []const u8,
+    } = null,
     enable_pii_redaction: bool = true,
 };
 
@@ -176,6 +179,10 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
         if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
         if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
         if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+        if (agent_cfg.http_request_allowed_domains) |allowed_domains| {
+            for (allowed_domains) |domain| allocator.free(domain);
+            allocator.free(allowed_domains);
+        }
     }
     allocator.free(agents);
 }
@@ -1241,6 +1248,9 @@ pub const Config = struct {
                             .api_key = encrypted_key,
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
+                            .http_request = if (agent_cfg.http_request_allowed_domains) |allowed_domains| .{
+                                .allowed_domains = allowed_domains,
+                            } else null,
                             .enable_pii_redaction = agent_cfg.enable_pii_redaction,
                         };
                         agent_count += 1;
@@ -1574,6 +1584,7 @@ pub const Config = struct {
         InvalidWebRelayTokenTtl,
         ReservedMainAgentName,
         UnknownAgentProvider,
+        AgentHttpAllowlistExpandsGlobal,
         InsecurePlaintextSecrets,
     };
 
@@ -1613,6 +1624,18 @@ pub const Config = struct {
             }
             if (self.providers.len > 0 and !isKnownProviderName(self.providers, agent_cfg.provider)) {
                 return ValidationError.UnknownAgentProvider;
+            }
+            if (agent_cfg.http_request_allowed_domains) |allowed_domains| {
+                for (allowed_domains) |domain| {
+                    var inherited = false;
+                    for (self.http_request.allowed_domains) |global_domain| {
+                        if (std.mem.eql(u8, domain, global_domain)) {
+                            inherited = true;
+                            break;
+                        }
+                    }
+                    if (!inherited) return ValidationError.AgentHttpAllowlistExpandsGlobal;
+                }
             }
         }
         if (self.gateway.port == 0) {
@@ -1821,6 +1844,7 @@ pub const Config = struct {
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
+            ValidationError.AgentHttpAllowlistExpandsGlobal => std.debug.print("Config error: agents.list[].http_request.allowed_domains must be a subset of the global http_request.allowed_domains list.\n", .{}),
             ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
             ValidationError.InvalidOtelEndpoint => std.debug.print("Config error: diagnostics.otel.endpoint/otel_endpoint must be an absolute https:// URL (or http:// for localhost/private or container-local collector hosts).\n", .{}),
             ValidationError.InvalidOtelHeader => std.debug.print("Config error: diagnostics.otel.headers/otel_headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
@@ -2643,6 +2667,7 @@ test "save roundtrip preserves extended config sections" {
             .api_key = "rk_test",
             .temperature = 0.2,
             .max_depth = 5,
+            .http_request_allowed_domains = &.{"127.0.0.1:8090"},
             .enable_pii_redaction = false,
         },
     };
@@ -2753,6 +2778,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
     cfg.http_request.timeout_secs = 8;
+    cfg.http_request.allowed_domains = &.{ "127.0.0.1:8090", "127.0.0.1:8091" };
     cfg.http_request.proxy = "socks5://127.0.0.1:1080";
     cfg.http_request.search_base_url = "https://searx.example.com";
     cfg.http_request.search_provider = "brave";
@@ -2818,6 +2844,8 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("gsk_test", loaded.model_routes[0].api_key.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
     try std.testing.expectEqualStrings("helper", loaded.agents[0].name);
+    try std.testing.expectEqual(@as(usize, 1), loaded.agents[0].http_request_allowed_domains.?.len);
+    try std.testing.expectEqualStrings("127.0.0.1:8090", loaded.agents[0].http_request_allowed_domains.?[0]);
     try std.testing.expect(!loaded.agents[0].enable_pii_redaction);
     try std.testing.expectEqual(@as(usize, 1), loaded.agent_bindings.len);
     try std.testing.expectEqualStrings("discord", loaded.agent_bindings[0].match.channel.?);
@@ -5271,6 +5299,49 @@ test "parse agents.list with id field" {
     defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqualStrings("researcher", cfg.agents[0].name);
+}
+
+test "named agent http allowlist is optional and explicit empty denies all" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents":{"list":[
+        \\  {"id":"inherit","provider":"anthropic","model":"claude-sonnet-4"},
+        \\  {"id":"deny","provider":"anthropic","model":"claude-sonnet-4","http_request":{"allowed_domains":[]}}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expect(cfg.agents[0].http_request_allowed_domains == null);
+    try std.testing.expect(cfg.agents[1].http_request_allowed_domains != null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.agents[1].http_request_allowed_domains.?.len);
+}
+
+test "validation rejects named agent http allowlist expansion" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .default_model = "test-model",
+    };
+    cfg.http_request.allowed_domains = &.{"127.0.0.1:8090"};
+    cfg.agents = &.{.{
+        .name = "other",
+        .provider = "openrouter",
+        .model = "test-model",
+        .http_request_allowed_domains = &.{"127.0.0.1:8091"},
+    }};
+
+    try std.testing.expectError(Config.ValidationError.AgentHttpAllowlistExpandsGlobal, cfg.validate());
+
+    cfg.agents = &.{.{
+        .name = "deny",
+        .provider = "openrouter",
+        .model = "test-model",
+        .http_request_allowed_domains = &.{},
+    }};
+    try cfg.validate();
 }
 
 test "parse agents.list primary model ref without provider field" {
