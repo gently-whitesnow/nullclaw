@@ -347,6 +347,7 @@ pub fn allTools(
     opts: struct {
         http_enabled: bool = false,
         http_allowed_domains: []const []const u8 = &.{},
+        http_deny_all: bool = false,
         http_max_response_size: u32 = 1_000_000,
         http_timeout_secs: u64 = 30,
         http_internal_bearer_token: ?[]const u8 = null,
@@ -537,10 +538,11 @@ pub fn allTools(
         const ht = try allocator.create(http_request.HttpRequestTool);
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
+            .deny_all = opts.http_deny_all,
             .max_response_size = opts.http_max_response_size,
             .timeout_secs = opts.http_timeout_secs,
         };
-        ht.setInternalBearer(opts.http_internal_bearer_origin, opts.http_internal_bearer_token);
+        try ht.setInternalBearer(opts.http_internal_bearer_origin, opts.http_internal_bearer_token);
         try list.append(allocator, ht.tool());
 
         const wst = try allocator.create(web_search.WebSearchTool);
@@ -675,6 +677,7 @@ pub fn subagentTools(
     opts: struct {
         http_enabled: bool = false,
         http_allowed_domains: []const []const u8 = &.{},
+        http_deny_all: bool = false,
         http_max_response_size: u32 = 1_000_000,
         http_timeout_secs: u64 = 30,
         http_internal_bearer_token: ?[]const u8 = null,
@@ -779,10 +782,11 @@ pub fn subagentTools(
         const ht = try allocator.create(http_request.HttpRequestTool);
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
+            .deny_all = opts.http_deny_all,
             .max_response_size = opts.http_max_response_size,
             .timeout_secs = opts.http_timeout_secs,
         };
-        ht.setInternalBearer(opts.http_internal_bearer_origin, opts.http_internal_bearer_token);
+        try ht.setInternalBearer(opts.http_internal_bearer_origin, opts.http_internal_bearer_token);
         try list.append(allocator, ht.tool());
     }
 

@@ -60,7 +60,8 @@ fn overtimePairingEnabled(config: *const Config) bool {
 
 fn overtimeOriginAllowlistEntry(origin: []const u8) []const u8 {
     const without_scheme = if (std.mem.indexOf(u8, origin, "://")) |index| origin[index + 3 ..] else origin;
-    return std_compat.mem.trimRight(u8, without_scheme, "/");
+    const path_start = std.mem.indexOfScalar(u8, without_scheme, '/') orelse without_scheme.len;
+    return without_scheme[0..path_start];
 }
 
 fn pairingCode(content: []const u8) ?[]const u8 {
@@ -77,12 +78,20 @@ fn pairingCode(content: []const u8) ?[]const u8 {
     return candidate;
 }
 
+pub fn isOvertimePairingMessage(content: []const u8) bool {
+    return pairingCode(content) != null;
+}
+
 test "overtime pairing code accepts deep links and direct codes only" {
     const code = "otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F";
     try std.testing.expectEqualStrings(code, pairingCode(code).?);
     try std.testing.expectEqualStrings(code, pairingCode("/start otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F").?);
     try std.testing.expect(pairingCode("regular message otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F") == null);
     try std.testing.expect(pairingCode("/start short") == null);
+    try std.testing.expectEqualStrings(
+        "127.0.0.1:8090",
+        overtimeOriginAllowlistEntry("http://127.0.0.1:8090/external/agent"),
+    );
 }
 
 fn consumeOvertimePairing(
@@ -117,7 +126,12 @@ fn consumeOvertimePairing(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidPairingResponse;
     const token_value = parsed.value.object.get("token") orelse return error.InvalidPairingResponse;
-    if (token_value != .string or !std.mem.startsWith(u8, token_value.string, "otb_")) return error.InvalidPairingResponse;
+    if (token_value != .string or
+        !std.mem.startsWith(u8, token_value.string, "otb_") or
+        token_value.string.len > tools_mod.http_request.HttpRequestTool.max_internal_bearer_token_len)
+    {
+        return error.InvalidPairingResponse;
+    }
     return allocator.dupe(u8, token_value.string);
 }
 
@@ -1317,13 +1331,24 @@ pub const SessionManager = struct {
         return null;
     }
 
-    fn refreshRuntimeCredentialLocked(self: *SessionManager, agent_id: []const u8, credential: []const u8) void {
+    fn refreshRuntimeCredentialLocked(self: *SessionManager, agent_id: []const u8, credential: []const u8) !void {
         const runtime = self.agent_runtimes.get(agent_id) orelse return;
         for (runtime.tools) |tool| {
             if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
             const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
-            http_tool.setInternalBearer(self.config.session.overtime_agent_origin, credential);
+            try http_tool.setInternalBearer(self.config.session.overtime_agent_origin, credential);
+            return;
         }
+    }
+
+    fn runtimeCredentialRejectedLocked(self: *SessionManager, agent_id: []const u8) bool {
+        const runtime = self.agent_runtimes.get(agent_id) orelse return false;
+        for (runtime.tools) |tool| {
+            if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
+            const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+            return http_tool.takeInternalBearerRejected();
+        }
+        return false;
     }
 
     fn maybeHandleOvertimePairingGate(
@@ -1345,6 +1370,10 @@ pub const SessionManager = struct {
             defer self.allocator.free(credential);
 
             self.mutex.lock();
+            self.refreshRuntimeCredentialLocked(agent_id, credential) catch {
+                self.mutex.unlock();
+                return self.allocator.dupe(u8, "Pairing credential cannot be installed.") catch null;
+            };
             self.setVerifiedBindingLocked(
                 direct_ctx.channel,
                 direct_ctx.account_id,
@@ -1354,7 +1383,6 @@ pub const SessionManager = struct {
                 std_compat.time.timestamp(),
             );
             self.markClaimStateDirtyLocked();
-            self.refreshRuntimeCredentialLocked(agent_id, credential);
             const snapshot = self.captureClaimStateSnapshotLocked();
             self.mutex.unlock();
             self.persistClaimStateSnapshot(snapshot);
@@ -1368,6 +1396,19 @@ pub const SessionManager = struct {
         ) catch return null;
         defer self.allocator.free(binding_key);
         self.mutex.lock();
+        if (self.runtimeCredentialRejectedLocked(agent_id)) {
+            const removed = self.removeVerifiedBindingLocked(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id);
+            const snapshot = if (removed) blk: {
+                self.markClaimStateDirtyLocked();
+                break :blk self.captureClaimStateSnapshotLocked();
+            } else null;
+            self.mutex.unlock();
+            self.persistClaimStateSnapshot(snapshot);
+            return self.allocator.dupe(
+                u8,
+                "Overtime access was revoked. Pair this Telegram account again from Overtime Settings.",
+            ) catch null;
+        }
         const connected = if (self.verified_bindings.get(binding_key)) |binding|
             binding.overtime_credential != null
         else
@@ -1495,6 +1536,7 @@ pub const SessionManager = struct {
 
         const workspace_dir = try self.resolveAgentWorkspaceDir(agent_id, named_agent);
         errdefer self.allocator.free(workspace_dir);
+        try fs_compat.makePath(workspace_dir);
 
         var mem_rt = memory_mod.initRuntime(self.allocator, &self.config.memory, workspace_dir);
         errdefer if (mem_rt) |*rt| rt.deinit();
@@ -1519,9 +1561,9 @@ pub const SessionManager = struct {
             }
         }
 
-        const owned_http_domains = if (self.config.session.overtime_agent_origin != null and
-            std.mem.startsWith(u8, agent_id, "peer-"))
-        blk: {
+        const managed_overtime_peer = self.config.session.overtime_agent_origin != null and
+            std.mem.startsWith(u8, agent_id, "peer-");
+        const owned_http_domains = if (managed_overtime_peer) blk: {
             const origin = self.config.session.overtime_agent_origin.?;
             const allowlist_entry = overtimeOriginAllowlistEntry(origin);
             var allowed = false;
@@ -1541,7 +1583,8 @@ pub const SessionManager = struct {
         );
         errdefer if (owned_http_domains) |domains| self.allocator.free(domains);
         const agent_http_allowed_domains = owned_http_domains orelse self.config.http_request.allowed_domains;
-        const overtime_credential = if (std.mem.startsWith(u8, agent_id, "peer-"))
+        const agent_http_deny_all = owned_http_domains != null and agent_http_allowed_domains.len == 0;
+        const overtime_credential = if (managed_overtime_peer)
             self.overtimeCredentialForAgentLocked(agent_id)
         else
             null;
@@ -1549,10 +1592,11 @@ pub const SessionManager = struct {
         const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
             .http_enabled = self.config.http_request.enabled,
             .http_allowed_domains = agent_http_allowed_domains,
+            .http_deny_all = agent_http_deny_all,
             .http_max_response_size = self.config.http_request.max_response_size,
             .http_timeout_secs = self.config.http_request.timeout_secs,
             .http_internal_bearer_token = overtime_credential,
-            .http_internal_bearer_origin = if (overtime_credential != null) self.config.session.overtime_agent_origin else null,
+            .http_internal_bearer_origin = if (managed_overtime_peer) self.config.session.overtime_agent_origin else null,
             .web_search_base_url = self.config.http_request.search_base_url,
             .web_search_provider = self.config.http_request.search_provider,
             .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
@@ -1570,7 +1614,7 @@ pub const SessionManager = struct {
             .backend_name = self.config.memory.backend,
             .sandbox_backend = self.config.security.sandbox.backend,
             .sandbox_enabled = self.config.sandboxEnabled(),
-        }) catch &.{};
+        }) catch |err| if (managed_overtime_peer) return err else &.{};
         errdefer if (runtime_tools.len > 0) tools_mod.deinitTools(self.allocator, runtime_tools);
 
         runtime.* = .{
@@ -3714,6 +3758,167 @@ test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {
     const default_session = try sm.getOrCreate("agent:main:whatsapp_web:direct:5511987654321");
     try testing.expectEqualStrings(base, default_session.agent.workspace_dir);
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "two auto-provisioned peers keep distinct deterministic workspaces after restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    var mock = MockProvider{ .response = "ok" };
+
+    var first_path: []u8 = undefined;
+    var second_path: []u8 = undefined;
+    {
+        var sm = testSessionManager(testing.allocator, &mock, &cfg);
+        defer sm.deinit();
+        const first = try sm.getOrCreate("agent:peer-aaaaaaaaaaaaaaaa:telegram:direct:1001");
+        const second = try sm.getOrCreate("agent:peer-bbbbbbbbbbbbbbbb:telegram:direct:2002");
+        try testing.expect(!std.mem.eql(u8, first.agent.workspace_dir, second.agent.workspace_dir));
+        first_path = try testing.allocator.dupe(u8, first.agent.workspace_dir);
+        second_path = try testing.allocator.dupe(u8, second.agent.workspace_dir);
+    }
+    defer testing.allocator.free(first_path);
+    defer testing.allocator.free(second_path);
+
+    var restarted = testSessionManager(testing.allocator, &mock, &cfg);
+    defer restarted.deinit();
+    const first = try restarted.getOrCreate("agent:peer-aaaaaaaaaaaaaaaa:telegram:direct:1001");
+    const second = try restarted.getOrCreate("agent:peer-bbbbbbbbbbbbbbbb:telegram:direct:2002");
+    try testing.expectEqualStrings(first_path, first.agent.workspace_dir);
+    try testing.expectEqualStrings(second_path, second.agent.workspace_dir);
+}
+
+test "overtime peer runtime narrows http to managed origin host" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.overtime_agent_origin = "http://127.0.0.1:8090/external/agent";
+    cfg.http_request.enabled = true;
+    cfg.http_request.allowed_domains = &.{ "127.0.0.1:8090", "127.0.0.1:8093" };
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+    _ = try sm.getOrCreate("agent:peer-deadbeefcafebabe:telegram:direct:1001");
+
+    const runtime = sm.agent_runtimes.get("peer-deadbeefcafebabe").?;
+    for (runtime.tools) |tool| {
+        if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
+        const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+        try testing.expect(!http_tool.deny_all);
+        try testing.expectEqual(@as(usize, 1), http_tool.allowed_domains.len);
+        try testing.expectEqualStrings("127.0.0.1:8090", http_tool.allowed_domains[0]);
+        try testing.expectEqualStrings(cfg.session.overtime_agent_origin.?, http_tool.internal_bearer_origin.?);
+        return;
+    }
+    return error.HttpRequestToolMissing;
+}
+
+test "overtime peer runtime fails closed when managed origin is outside global allowlist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.overtime_agent_origin = "http://127.0.0.1:8090/external/agent";
+    cfg.http_request.enabled = true;
+    cfg.http_request.allowed_domains = &.{"127.0.0.1:8093"};
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+    _ = try sm.getOrCreate("agent:peer-deadbeefcafebabe:telegram:direct:1001");
+
+    const runtime = sm.agent_runtimes.get("peer-deadbeefcafebabe").?;
+    for (runtime.tools) |tool| {
+        if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
+        const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+        try testing.expect(http_tool.deny_all);
+        return;
+    }
+    return error.HttpRequestToolMissing;
+}
+
+test "overtime 401 revokes local binding before the next model turn" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const agent_id = try agent_routing.buildAutoProvisionedAgentId(testing.allocator, "telegram", "main", "1001");
+    defer testing.allocator.free(agent_id);
+    const session_key = try std.fmt.allocPrint(testing.allocator, "agent:{s}:telegram:direct:1001", .{agent_id});
+    defer testing.allocator.free(session_key);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.overtime_pairing_url = "http://127.0.0.1:8090/external/telegram-pairing/consume";
+    cfg.session.overtime_pairing_service_token = "machine-token";
+    cfg.session.overtime_agent_origin = "http://127.0.0.1:8090/external/agent";
+    cfg.http_request.enabled = true;
+    cfg.http_request.allowed_domains = &.{"127.0.0.1:8090"};
+
+    var mock = MockProvider{ .response = "model must not run" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+    _ = try sm.getOrCreate(session_key);
+
+    {
+        sm.mutex.lock();
+        defer sm.mutex.unlock();
+        sm.setVerifiedBindingLocked("telegram", "main", "1001", "1001", "otb_selector.secret", std_compat.time.timestamp());
+        try sm.refreshRuntimeCredentialLocked(agent_id, "otb_selector.secret");
+        const runtime = sm.agent_runtimes.get(agent_id).?;
+        for (runtime.tools) |tool| {
+            if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
+            const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+            http_tool.recordInternalBearerStatus(401);
+        }
+    }
+
+    const reply = sm.maybeHandleOvertimePairingGate(session_key, "regular message", .{
+        .channel = "telegram",
+        .account_id = "main",
+        .sender_id = "1001",
+        .peer_id = "1001",
+        .is_group = false,
+    }).?;
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "revoked") != null);
+
+    const binding_key = try sm.claimBindingKeyOwned("telegram", "main", "1001");
+    defer testing.allocator.free(binding_key);
+    sm.mutex.lock();
+    defer sm.mutex.unlock();
+    try testing.expect(sm.verified_bindings.get(binding_key) == null);
 }
 
 test "getOrCreate named agent workspace override creates dedicated runtime" {

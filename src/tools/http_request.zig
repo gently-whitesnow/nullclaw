@@ -14,27 +14,47 @@ const log = std.log.scoped(.http_request);
 /// Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods with
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
+    pub const max_internal_bearer_token_len = 128;
+
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    deny_all: bool = false,
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 60,
     internal_bearer_origin: ?[]const u8 = null,
-    internal_bearer_token: [128]u8 = undefined,
+    internal_bearer_token: [max_internal_bearer_token_len]u8 = undefined,
     internal_bearer_token_len: usize = 0,
+    internal_bearer_rejected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn setInternalBearer(self: *HttpRequestTool, origin: ?[]const u8, token: ?[]const u8) void {
+    pub fn setInternalBearer(self: *HttpRequestTool, origin: ?[]const u8, token: ?[]const u8) !void {
         self.internal_bearer_origin = origin;
         @memset(&self.internal_bearer_token, 0);
         self.internal_bearer_token_len = 0;
+        self.internal_bearer_rejected.store(false, .release);
         const value = token orelse return;
-        if (value.len > self.internal_bearer_token.len) return;
+        if (value.len > self.internal_bearer_token.len) return error.InternalBearerTooLong;
         @memcpy(self.internal_bearer_token[0..value.len], value);
         self.internal_bearer_token_len = value.len;
     }
 
-    fn usesInternalBearer(self: *const HttpRequestTool, url: []const u8) bool {
+    fn isManagedOriginUrl(self: *const HttpRequestTool, url: []const u8) bool {
         const origin = self.internal_bearer_origin orelse return false;
-        if (self.internal_bearer_token_len == 0 or !std.mem.startsWith(u8, url, origin)) return false;
+        if (!std.mem.startsWith(u8, url, origin)) return false;
         return url.len == origin.len or url[origin.len] == '/';
+    }
+
+    fn usesInternalBearer(self: *const HttpRequestTool, url: []const u8) bool {
+        return self.internal_bearer_token_len > 0 and self.isManagedOriginUrl(url);
+    }
+
+    pub fn recordInternalBearerStatus(self: *HttpRequestTool, status_code: u16) void {
+        if (status_code != 401 or self.internal_bearer_origin == null) return;
+        @memset(&self.internal_bearer_token, 0);
+        self.internal_bearer_token_len = 0;
+        self.internal_bearer_rejected.store(true, .release);
+    }
+
+    pub fn takeInternalBearerRejected(self: *HttpRequestTool) bool {
+        return self.internal_bearer_rejected.swap(false, .acq_rel);
     }
 
     pub const tool_name = "http_request";
@@ -56,6 +76,14 @@ pub const HttpRequestTool = struct {
     pub fn execute(self: *HttpRequestTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter");
+
+        if (self.deny_all) return ToolResult.fail("HTTP requests are disabled by the effective allowlist");
+        if (self.internal_bearer_origin != null and !self.isManagedOriginUrl(url)) {
+            return ToolResult.fail("URL is outside the runtime-managed origin");
+        }
+        if (self.internal_bearer_origin != null and self.internal_bearer_token_len == 0) {
+            return ToolResult.fail("Runtime credential is unavailable; pair this peer again");
+        }
 
         const method_str = root.getString(args, "method") orelse "GET";
 
@@ -203,6 +231,7 @@ pub const HttpRequestTool = struct {
 
         const status_code = status_result.status_code;
         const success = status_code >= 200 and status_code < 300;
+        if (self.usesInternalBearer(url)) self.recordInternalBearerStatus(status_code);
 
         // Build redacted headers display for custom request headers
         const redacted = redactHeadersForDisplay(allocator, custom_headers) catch try allocator.dupe(u8, "");
@@ -699,14 +728,54 @@ test "http_request schema has headers" {
 
 test "http_request internal bearer is scoped to its exact origin" {
     var ht = HttpRequestTool{};
-    ht.setInternalBearer("http://127.0.0.1:8090", "otb_selector.secret");
-    try std.testing.expect(ht.usesInternalBearer("http://127.0.0.1:8090/api/tasks"));
+    try ht.setInternalBearer("http://127.0.0.1:8090/external/agent", "otb_selector.secret");
+    try std.testing.expect(ht.usesInternalBearer("http://127.0.0.1:8090/external/agent/api/tasks"));
+    try std.testing.expect(!ht.usesInternalBearer("http://127.0.0.1:8090/api/tasks"));
     try std.testing.expect(!ht.usesInternalBearer("http://127.0.0.1:80900/api/tasks"));
     try std.testing.expect(!ht.usesInternalBearer("http://127.0.0.1:8091/api/tasks"));
     try std.testing.expectEqualStrings("otb_selector.secret", ht.internal_bearer_token[0..ht.internal_bearer_token_len]);
 
-    ht.setInternalBearer("http://127.0.0.1:8090", "otb_replaced.secret");
+    try ht.setInternalBearer("http://127.0.0.1:8090/external/agent", "otb_replaced.secret");
     try std.testing.expectEqualStrings("otb_replaced.secret", ht.internal_bearer_token[0..ht.internal_bearer_token_len]);
+}
+
+test "http_request managed origin rejects legacy owner path and missing credential" {
+    const domains = [_][]const u8{"127.0.0.1:8090"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    try ht.setInternalBearer("http://127.0.0.1:8090/external/agent", "otb_selector.secret");
+    var parsed = try root.parseTestArgs("{\"url\":\"http://127.0.0.1:8090/api/tasks\"}");
+    defer parsed.deinit();
+    var result = try ht.tool().execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expectEqualStrings("URL is outside the runtime-managed origin", result.error_msg.?);
+
+    try ht.setInternalBearer("http://127.0.0.1:8090/external/agent", null);
+    var managed = try root.parseTestArgs("{\"url\":\"http://127.0.0.1:8090/external/agent/api/tasks\"}");
+    defer managed.deinit();
+    result = try ht.tool().execute(std.testing.allocator, managed.value.object);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "pair this peer again") != null);
+}
+
+test "http_request effective empty intersection fails closed" {
+    var ht = HttpRequestTool{ .deny_all = true };
+    const parsed = try root.parseTestArgs("{\"url\":\"https://example.com\"}");
+    defer parsed.deinit();
+    const result = try ht.tool().execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expectEqualStrings("HTTP requests are disabled by the effective allowlist", result.error_msg.?);
+}
+
+test "http_request rejects oversized managed credential" {
+    var ht = HttpRequestTool{};
+    const oversized = [_]u8{'x'} ** (HttpRequestTool.max_internal_bearer_token_len + 1);
+    try std.testing.expectError(error.InternalBearerTooLong, ht.setInternalBearer("https://example.com/api", &oversized));
+}
+
+test "http_request records managed credential rejection" {
+    var ht = HttpRequestTool{};
+    try ht.setInternalBearer("https://example.com/api", "otb_selector.secret");
+    ht.recordInternalBearerStatus(401);
+    try std.testing.expectEqual(@as(usize, 0), ht.internal_bearer_token_len);
+    try std.testing.expect(ht.takeInternalBearerRejected());
+    try std.testing.expect(!ht.takeInternalBearerRejected());
 }
 
 test "validateMethod accepts valid methods" {
