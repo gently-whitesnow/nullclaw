@@ -121,7 +121,7 @@ pub fn resolveLinkedPeerId(
 
 /// Build a deterministic synthetic agent id for direct-peer auto-provision.
 /// Format: `peer-{16 hex chars}`.
-fn buildAutoProvisionedAgentId(
+pub fn buildAutoProvisionedAgentId(
     allocator: std.mem.Allocator,
     channel: []const u8,
     account_id: []const u8,

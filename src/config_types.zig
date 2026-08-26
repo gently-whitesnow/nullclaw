@@ -1933,6 +1933,14 @@ pub const SessionConfig = struct {
     claim_max_attempts: u32 = 5,
     /// Lockout duration in seconds after too many failed claim attempts.
     claim_lockout_secs: u32 = 300,
+    /// Overtime endpoint used to exchange Telegram pairing codes before a model turn.
+    overtime_pairing_url: ?[]const u8 = null,
+    /// Machine credential for the pairing endpoint. It is never exposed to tools.
+    overtime_pairing_service_token: ?[]const u8 = null,
+    /// Exact Overtime origin made available to a paired peer runtime.
+    overtime_agent_origin: ?[]const u8 = null,
+    /// Read-only image directory copied into each auto-provisioned workspace.
+    auto_provision_workspace_template: ?[]const u8 = null,
     typing_interval_secs: u32 = 5,
     /// Maximum concurrent message processing tasks per channel.
     /// When set to 0 or 1, messages are processed sequentially.

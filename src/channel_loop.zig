@@ -793,6 +793,10 @@ fn handleTelegramInteractiveCallback(
     return true;
 }
 
+fn shouldSendTelegramStartGreeting(content: []const u8) bool {
+    return !session_mod.isOvertimePairingMessage(content);
+}
+
 fn handleTelegramBuiltinCommand(
     allocator: std.mem.Allocator,
     session_mgr: *session_mod.SessionManager,
@@ -810,6 +814,7 @@ fn handleTelegramBuiltinCommand(
     const cmd = control_plane.parseSlashCommand(content) orelse return false;
 
     if (control_plane.isSlashName(cmd, "start")) {
+        if (!shouldSendTelegramStartGreeting(content)) return false;
         sendTelegramStartGreeting(tg_ptr, sender, first_name, sender_identity, model, reply_to_id);
         return true;
     }
@@ -922,6 +927,14 @@ fn handleTelegramBuiltinCommand(
     };
     tg_ptr.setTaskReaction(sender, message_id, .done);
     return true;
+}
+
+test "telegram deep-link pairing bypasses builtin start greeting" {
+    const pairing = "/start otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F";
+    const pairing_cmd = control_plane.parseSlashCommand(pairing).?;
+    try std.testing.expect(control_plane.isSlashName(pairing_cmd, "start"));
+    try std.testing.expect(!shouldSendTelegramStartGreeting(pairing));
+    try std.testing.expect(shouldSendTelegramStartGreeting("/start"));
 }
 
 fn processTelegramMessage(
