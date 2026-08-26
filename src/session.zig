@@ -304,11 +304,15 @@ const AgentRuntime = struct {
     session_store: ?memory_mod.SessionStore,
     response_cache: ?*memory_mod.cache.ResponseCache,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
+    /// Narrowed `http_request` allowlist handed to this runtime's tools. The
+    /// entries stay owned by the config; only the slice belongs here.
+    http_allowed_domains: ?[]const []const u8 = null,
 
     fn deinit(self: *AgentRuntime, allocator: Allocator) void {
         if (self.tools.len > 0) tools_mod.deinitTools(allocator, self.tools);
         if (self.bootstrap_provider) |bp| bp.deinit();
         if (self.mem_rt) |*rt| rt.deinit();
+        if (self.http_allowed_domains) |domains| allocator.free(domains);
         allocator.free(self.workspace_dir);
         allocator.free(self.agent_id);
     }
@@ -1274,6 +1278,30 @@ pub const SessionManager = struct {
         return cfg;
     }
 
+    /// Per-agent `http_request` reach: the agent's own list, kept inside the
+    /// global one. An override may only take origins away — otherwise a named
+    /// agent could reach hosts the instance never allowed.
+    pub fn narrowedHttpAllowedDomains(
+        allocator: Allocator,
+        global: []const []const u8,
+        named_agent: ?NamedAgentConfig,
+    ) !?[]const []const u8 {
+        const cfg = named_agent orelse return null;
+        if (cfg.http_allowed_domains.len == 0) return null;
+
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer list.deinit(allocator);
+        for (cfg.http_allowed_domains) |candidate| {
+            for (global) |allowed| {
+                if (std.mem.eql(u8, candidate, allowed)) {
+                    try list.append(allocator, allowed);
+                    break;
+                }
+            }
+        }
+        return try list.toOwnedSlice(allocator);
+    }
+
     fn createAgentRuntime(
         self: *SessionManager,
         agent_id: []const u8,
@@ -1306,9 +1334,17 @@ pub const SessionManager = struct {
         var project_ctx = onboard.ProjectContext{};
         onboard.scaffoldWorkspace(self.allocator, workspace_dir, &project_ctx, bootstrap_provider) catch {};
 
+        const owned_http_domains = try narrowedHttpAllowedDomains(
+            self.allocator,
+            self.config.http_request.allowed_domains,
+            named_agent,
+        );
+        errdefer if (owned_http_domains) |domains| self.allocator.free(domains);
+        const agent_http_allowed_domains = owned_http_domains orelse self.config.http_request.allowed_domains;
+
         const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
             .http_enabled = self.config.http_request.enabled,
-            .http_allowed_domains = self.config.http_request.allowed_domains,
+            .http_allowed_domains = agent_http_allowed_domains,
             .http_max_response_size = self.config.http_request.max_response_size,
             .http_timeout_secs = self.config.http_request.timeout_secs,
             .web_search_base_url = self.config.http_request.search_base_url,
@@ -1342,6 +1378,7 @@ pub const SessionManager = struct {
             .session_store = session_store,
             .response_cache = response_cache,
             .bootstrap_provider = bootstrap_provider,
+            .http_allowed_domains = owned_http_domains,
         };
 
         tools_mod.bindMemoryTools(runtime.tools, runtime.mem);
@@ -6025,4 +6062,49 @@ test "reloadSkillsAll does not affect session count" {
 
     _ = sm.reloadSkillsAll();
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
+}
+
+test "narrowedHttpAllowedDomains keeps only the agent's own origins" {
+    const global = [_][]const u8{ "127.0.0.1:8091", "127.0.0.1:8092", "127.0.0.1:8093" };
+    const own = [_][]const u8{"127.0.0.1:8092"};
+    const profile = config_types.NamedAgentConfig{
+        .name = "second",
+        .provider = "openai",
+        .model = "gpt-5.2",
+        .http_allowed_domains = &own,
+    };
+
+    const narrowed = (try SessionManager.narrowedHttpAllowedDomains(testing.allocator, &global, profile)).?;
+    defer testing.allocator.free(narrowed);
+
+    try testing.expectEqual(@as(usize, 1), narrowed.len);
+    try testing.expectEqualStrings("127.0.0.1:8092", narrowed[0]);
+}
+
+test "narrowedHttpAllowedDomains cannot widen the instance allowlist" {
+    const global = [_][]const u8{"127.0.0.1:8092"};
+    const own = [_][]const u8{ "127.0.0.1:8091", "example.com" };
+    const profile = config_types.NamedAgentConfig{
+        .name = "second",
+        .provider = "openai",
+        .model = "gpt-5.2",
+        .http_allowed_domains = &own,
+    };
+
+    const narrowed = (try SessionManager.narrowedHttpAllowedDomains(testing.allocator, &global, profile)).?;
+    defer testing.allocator.free(narrowed);
+
+    try testing.expectEqual(@as(usize, 0), narrowed.len);
+}
+
+test "narrowedHttpAllowedDomains falls back to the global list" {
+    const global = [_][]const u8{"127.0.0.1:8092"};
+    const profile = config_types.NamedAgentConfig{
+        .name = "second",
+        .provider = "openai",
+        .model = "gpt-5.2",
+    };
+
+    try testing.expect(try SessionManager.narrowedHttpAllowedDomains(testing.allocator, &global, profile) == null);
+    try testing.expect(try SessionManager.narrowedHttpAllowedDomains(testing.allocator, &global, null) == null);
 }

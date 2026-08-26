@@ -1836,6 +1836,10 @@ pub const NamedAgentConfig = struct {
     /// outbound provider messages so user data does not leak to remote LLMs.
     /// Default true (secure-by-default). Disable explicitly for known-local-only agents.
     enable_pii_redaction: bool = true,
+    /// Narrows `http_request.allowed_domains` for this agent's own runtime.
+    /// Empty keeps the global list. Entries outside the global list are ignored:
+    /// a per-agent override may only take reach away, never grant it.
+    http_allowed_domains: []const []const u8 = &.{},
 };
 
 // ── MCP Server Config ──────────────────────────────────────────
