@@ -7814,6 +7814,22 @@ test "session config: parse claim gate settings" {
     allocator.free(cfg.session.claim_admin_secret.?);
 }
 
+test "session config: parse overtime pairing settings" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session":{"auto_provision_direct_agents":true,"overtime_pairing_url":"http://127.0.0.1:8090/external/telegram-pairing/consume","overtime_pairing_service_token":"machine-token","overtime_agent_origin":"http://127.0.0.1:8090","auto_provision_workspace_template":"/opt/overtime/user-workspace-template"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.session.auto_provision_direct_agents);
+    try std.testing.expectEqualStrings("machine-token", cfg.session.overtime_pairing_service_token.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8090", cfg.session.overtime_agent_origin.?);
+    allocator.free(cfg.session.overtime_pairing_url.?);
+    allocator.free(cfg.session.overtime_pairing_service_token.?);
+    allocator.free(cfg.session.overtime_agent_origin.?);
+    allocator.free(cfg.session.auto_provision_workspace_template.?);
+}
+
 test "session config: parse identity_links map format" {
     const allocator = std.testing.allocator;
     const json =

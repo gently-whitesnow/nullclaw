@@ -13,6 +13,7 @@ const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const fs_compat = @import("fs_compat.zig");
+const http_util = @import("http_util.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
 const turn_persistence = @import("agent/turn_persistence.zig");
@@ -28,6 +29,7 @@ const governance = @import("governance.zig");
 const redaction = @import("redaction.zig");
 const util = @import("util.zig");
 const onboard = @import("onboard.zig");
+const skills_mod = @import("skills.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const inbound_router = @import("inbound_router.zig");
@@ -49,6 +51,76 @@ const RUNTIME_COMMAND_ROLE = memory_mod.RUNTIME_COMMAND_ROLE;
 const CLAIM_STATE_FILENAME = "identity_claims.json";
 const CLAIM_STATE_VERSION: u32 = 1;
 
+fn overtimePairingEnabled(config: *const Config) bool {
+    return config.session.auto_provision_direct_agents and
+        config.session.overtime_pairing_url != null and
+        config.session.overtime_pairing_service_token != null and
+        config.session.overtime_agent_origin != null;
+}
+
+fn overtimeOriginAllowlistEntry(origin: []const u8) []const u8 {
+    const without_scheme = if (std.mem.indexOf(u8, origin, "://")) |index| origin[index + 3 ..] else origin;
+    return std_compat.mem.trimRight(u8, without_scheme, "/");
+}
+
+fn pairingCode(content: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    const candidate = for ([_][]const u8{ "/start", "/pair" }) |command| {
+        if (!std.mem.startsWith(u8, trimmed, command)) continue;
+        if (trimmed.len <= command.len or (trimmed[command.len] != ' ' and trimmed[command.len] != '\t')) return null;
+        break std.mem.trim(u8, trimmed[command.len + 1 ..], " \t\r\n");
+    } else trimmed;
+    if (candidate.len != 47 or !std.mem.startsWith(u8, candidate, "otp_")) return null;
+    for (candidate[4..]) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return null;
+    }
+    return candidate;
+}
+
+test "overtime pairing code accepts deep links and direct codes only" {
+    const code = "otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F";
+    try std.testing.expectEqualStrings(code, pairingCode(code).?);
+    try std.testing.expectEqualStrings(code, pairingCode("/start otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F").?);
+    try std.testing.expect(pairingCode("regular message otp_0123456789abcdefghijklmnopqrstuvwxyzABCDE_F") == null);
+    try std.testing.expect(pairingCode("/start short") == null);
+}
+
+fn consumeOvertimePairing(
+    allocator: Allocator,
+    config: *const Config,
+    code: []const u8,
+    telegram_id: []const u8,
+) ![]u8 {
+    const url = config.session.overtime_pairing_url orelse return error.PairingUnavailable;
+    const service_token = config.session.overtime_pairing_service_token orelse return error.PairingUnavailable;
+    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{service_token});
+    defer allocator.free(auth);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"code\":{f},\"telegram_id\":{f}}}",
+        .{ std.json.fmt(code, .{}), std.json.fmt(telegram_id, .{}) },
+    );
+    defer allocator.free(body);
+    const response = try http_util.httpRequestWithStatusAndHeaders(
+        allocator,
+        .POST,
+        url,
+        body,
+        &.{auth},
+        "application/json",
+        null,
+    );
+    defer allocator.free(response.headers);
+    defer allocator.free(response.body);
+    if (response.status_code < 200 or response.status_code >= 300) return error.PairingRejected;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPairingResponse;
+    const token_value = parsed.value.object.get("token") orelse return error.InvalidPairingResponse;
+    if (token_value != .string or !std.mem.startsWith(u8, token_value.string, "otb_")) return error.InvalidPairingResponse;
+    return allocator.dupe(u8, token_value.string);
+}
+
 const ClaimDirectContext = struct {
     channel: []const u8,
     account_id: []const u8,
@@ -57,6 +129,7 @@ const ClaimDirectContext = struct {
 
 const VerifiedBinding = struct {
     canonical_user_id: []u8,
+    overtime_credential: ?[]u8 = null,
     verified_at: i64,
 };
 
@@ -370,8 +443,11 @@ pub const SessionManager = struct {
         tools_mod.bindMemoryTools(tools, mem);
 
         const claim_state_path = blk: {
-            const secret = config.session.claim_secret orelse break :blk null;
-            if (std.mem.trim(u8, secret, " \t\r\n").len == 0) break :blk null;
+            const claim_enabled = if (config.session.claim_secret) |secret|
+                std.mem.trim(u8, secret, " \t\r\n").len > 0
+            else
+                false;
+            if (!claim_enabled and !overtimePairingEnabled(config)) break :blk null;
             const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
             break :blk std_compat.fs.path.join(allocator, &.{ config_dir, "state", CLAIM_STATE_FILENAME }) catch null;
         };
@@ -427,6 +503,7 @@ pub const SessionManager = struct {
         while (bindings_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.canonical_user_id);
+            if (entry.value_ptr.overtime_credential) |credential| self.allocator.free(credential);
         }
         self.verified_bindings.deinit(self.allocator);
 
@@ -795,21 +872,32 @@ pub const SessionManager = struct {
         };
     }
 
-    fn setVerifiedBindingLocked(self: *SessionManager, channel: []const u8, account_id: []const u8, peer_id: []const u8, canonical_user_id: []const u8, verified_at: i64) void {
+    fn setVerifiedBindingLocked(self: *SessionManager, channel: []const u8, account_id: []const u8, peer_id: []const u8, canonical_user_id: []const u8, overtime_credential: ?[]const u8, verified_at: i64) void {
         const key = self.claimBindingKeyOwned(channel, account_id, peer_id) catch return;
         if (self.verified_bindings.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
             self.allocator.free(removed.value.canonical_user_id);
+            if (removed.value.overtime_credential) |credential| self.allocator.free(credential);
         }
 
         const canonical_owned = self.allocator.dupe(u8, canonical_user_id) catch {
             self.allocator.free(key);
             return;
         };
+        const credential_owned = if (overtime_credential) |credential|
+            self.allocator.dupe(u8, credential) catch {
+                self.allocator.free(canonical_owned);
+                self.allocator.free(key);
+                return;
+            }
+        else
+            null;
         self.verified_bindings.put(self.allocator, key, .{
             .canonical_user_id = canonical_owned,
+            .overtime_credential = credential_owned,
             .verified_at = verified_at,
         }) catch {
+            if (credential_owned) |credential| self.allocator.free(credential);
             self.allocator.free(canonical_owned);
             self.allocator.free(key);
         };
@@ -821,6 +909,7 @@ pub const SessionManager = struct {
         if (self.verified_bindings.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
             self.allocator.free(removed.value.canonical_user_id);
+            if (removed.value.overtime_credential) |credential| self.allocator.free(credential);
             return true;
         }
         return false;
@@ -885,7 +974,11 @@ pub const SessionManager = struct {
                         if (account_v == .string and account_v.string.len > 0) account_v.string else "default"
                     else
                         "default";
-                    self.setVerifiedBindingLocked(channel_v.string, account_id, peer_v.string, canonical_v.string, verified_at);
+                    const credential = if (item.object.get("overtime_credential")) |credential_v|
+                        if (credential_v == .string and credential_v.string.len > 0) credential_v.string else null
+                    else
+                        null;
+                    self.setVerifiedBindingLocked(channel_v.string, account_id, peer_v.string, canonical_v.string, credential, verified_at);
                 }
             }
         }
@@ -962,12 +1055,13 @@ pub const SessionManager = struct {
             const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
             if (wrote_binding) w.writeAll(",") catch return null;
             w.print(
-                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"canonical_user_id\":{f},\"verified_at\":{d}}}",
+                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"canonical_user_id\":{f},\"overtime_credential\":{f},\"verified_at\":{d}}}",
                 .{
                     std.json.fmt(split.channel, .{}),
                     std.json.fmt(split.account_id, .{}),
                     std.json.fmt(split.peer_id, .{}),
                     std.json.fmt(entry.value_ptr.canonical_user_id, .{}),
+                    std.json.fmt(entry.value_ptr.overtime_credential orelse "", .{}),
                     entry.value_ptr.verified_at,
                 },
             ) catch return null;
@@ -1046,7 +1140,9 @@ pub const SessionManager = struct {
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path}) catch return;
         defer self.allocator.free(tmp_path);
 
-        var tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{}) catch return;
+        var tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{
+            .permissions = std_compat.fs.permissionsFromMode(0o600),
+        }) catch return;
         tmp_file.writeAll(claim_snapshot.content) catch {
             tmp_file.close();
             std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
@@ -1056,7 +1152,10 @@ pub const SessionManager = struct {
 
         std_compat.fs.renameAbsolute(tmp_path, path) catch {
             std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
-            const file = std_compat.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+            const file = std_compat.fs.createFileAbsolute(path, .{
+                .truncate = true,
+                .permissions = std_compat.fs.permissionsFromMode(0o600),
+            }) catch return;
             defer file.close();
             file.writeAll(claim_snapshot.content) catch return;
         };
@@ -1167,6 +1266,7 @@ pub const SessionManager = struct {
                     direct_ctx.account_id,
                     direct_ctx.peer_id,
                     token.canonical_user_id,
+                    null,
                     now_ts,
                 );
                 self.putClaimNonceLocked(token.nonce, token.expires_at);
@@ -1197,6 +1297,86 @@ pub const SessionManager = struct {
         return self.allocator.dupe(
             u8,
             "Identity verification required before agent provisioning. Send `/claim <token>` to continue.",
+        ) catch null;
+    }
+
+    fn overtimeCredentialForAgentLocked(self: *SessionManager, agent_id: []const u8) ?[]const u8 {
+        var it = self.verified_bindings.iterator();
+        while (it.next()) |entry| {
+            const credential = entry.value_ptr.overtime_credential orelse continue;
+            const binding = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
+            const generated = agent_routing.buildAutoProvisionedAgentId(
+                self.allocator,
+                binding.channel,
+                binding.account_id,
+                binding.peer_id,
+            ) catch continue;
+            defer self.allocator.free(generated);
+            if (std.mem.eql(u8, generated, agent_id)) return credential;
+        }
+        return null;
+    }
+
+    fn refreshRuntimeCredentialLocked(self: *SessionManager, agent_id: []const u8, credential: []const u8) void {
+        const runtime = self.agent_runtimes.get(agent_id) orelse return;
+        for (runtime.tools) |tool| {
+            if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
+            const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+            http_tool.setInternalBearer(self.config.session.overtime_agent_origin, credential);
+        }
+    }
+
+    fn maybeHandleOvertimePairingGate(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+    ) ?[]const u8 {
+        if (!overtimePairingEnabled(self.config)) return null;
+        const agent_id = parseAgentIdFromSessionKey(session_key);
+        if (!std.mem.startsWith(u8, agent_id, "peer-")) return null;
+        const direct_ctx = directContextForClaims(session_key, conversation_context) orelse return null;
+        if (!std.mem.eql(u8, direct_ctx.channel, "telegram")) return null;
+
+        if (pairingCode(content)) |code| {
+            const credential = consumeOvertimePairing(self.allocator, self.config, code, direct_ctx.peer_id) catch {
+                return self.allocator.dupe(u8, "Pairing code is invalid or unavailable.") catch null;
+            };
+            defer self.allocator.free(credential);
+
+            self.mutex.lock();
+            self.setVerifiedBindingLocked(
+                direct_ctx.channel,
+                direct_ctx.account_id,
+                direct_ctx.peer_id,
+                direct_ctx.peer_id,
+                credential,
+                std_compat.time.timestamp(),
+            );
+            self.markClaimStateDirtyLocked();
+            self.refreshRuntimeCredentialLocked(agent_id, credential);
+            const snapshot = self.captureClaimStateSnapshotLocked();
+            self.mutex.unlock();
+            self.persistClaimStateSnapshot(snapshot);
+            return self.allocator.dupe(u8, "Overtime connected. You can send a regular message now.") catch null;
+        }
+
+        const binding_key = self.claimBindingKeyOwned(
+            direct_ctx.channel,
+            direct_ctx.account_id,
+            direct_ctx.peer_id,
+        ) catch return null;
+        defer self.allocator.free(binding_key);
+        self.mutex.lock();
+        const connected = if (self.verified_bindings.get(binding_key)) |binding|
+            binding.overtime_credential != null
+        else
+            false;
+        self.mutex.unlock();
+        if (connected) return null;
+        return self.allocator.dupe(
+            u8,
+            "Connect this Telegram account from Overtime Settings before sending regular messages.",
         ) catch null;
     }
 
@@ -1333,20 +1513,46 @@ pub const SessionManager = struct {
 
         var project_ctx = onboard.ProjectContext{};
         onboard.scaffoldWorkspace(self.allocator, workspace_dir, &project_ctx, bootstrap_provider) catch {};
+        if (std.mem.startsWith(u8, agent_id, "peer-")) {
+            if (self.config.session.auto_provision_workspace_template) |template| {
+                try skills_mod.copyWorkspaceTemplate(self.allocator, template, workspace_dir);
+            }
+        }
 
-        const owned_http_domains = try narrowedHttpAllowedDomains(
+        const owned_http_domains = if (self.config.session.overtime_agent_origin != null and
+            std.mem.startsWith(u8, agent_id, "peer-"))
+        blk: {
+            const origin = self.config.session.overtime_agent_origin.?;
+            const allowlist_entry = overtimeOriginAllowlistEntry(origin);
+            var allowed = false;
+            for (self.config.http_request.allowed_domains) |candidate| {
+                if (std.mem.eql(u8, candidate, allowlist_entry)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            const domains = try self.allocator.alloc([]const u8, if (allowed) 1 else 0);
+            if (allowed) domains[0] = allowlist_entry;
+            break :blk domains;
+        } else try narrowedHttpAllowedDomains(
             self.allocator,
             self.config.http_request.allowed_domains,
             named_agent,
         );
         errdefer if (owned_http_domains) |domains| self.allocator.free(domains);
         const agent_http_allowed_domains = owned_http_domains orelse self.config.http_request.allowed_domains;
+        const overtime_credential = if (std.mem.startsWith(u8, agent_id, "peer-"))
+            self.overtimeCredentialForAgentLocked(agent_id)
+        else
+            null;
 
         const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
             .http_enabled = self.config.http_request.enabled,
             .http_allowed_domains = agent_http_allowed_domains,
             .http_max_response_size = self.config.http_request.max_response_size,
             .http_timeout_secs = self.config.http_request.timeout_secs,
+            .http_internal_bearer_token = overtime_credential,
+            .http_internal_bearer_origin = if (overtime_credential != null) self.config.session.overtime_agent_origin else null,
             .web_search_base_url = self.config.http_request.search_base_url,
             .web_search_provider = self.config.http_request.search_provider,
             .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
@@ -1839,6 +2045,10 @@ pub const SessionManager = struct {
         stream_sink: ?streaming.Sink,
         progress_sink: ?agent_mod.ProgressSink,
     ) ![]const u8 {
+        if (self.maybeHandleOvertimePairingGate(session_key, content, conversation_context)) |gate_reply| {
+            return gate_reply;
+        }
+
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 

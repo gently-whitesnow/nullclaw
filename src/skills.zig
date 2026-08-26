@@ -2174,6 +2174,10 @@ fn copyDirRecursiveSecure(allocator: std.mem.Allocator, src_root: []const u8, ds
     stack.deinit(allocator);
 }
 
+pub fn copyWorkspaceTemplate(allocator: std.mem.Allocator, source: []const u8, workspace: []const u8) !void {
+    try copyDirRecursiveSecure(allocator, source, workspace);
+}
+
 fn installSkillDirectoryToWorkspace(
     allocator: std.mem.Allocator,
     source_path: []const u8,

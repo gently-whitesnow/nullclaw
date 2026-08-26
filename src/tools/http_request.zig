@@ -17,6 +17,25 @@ pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 60,
+    internal_bearer_origin: ?[]const u8 = null,
+    internal_bearer_token: [128]u8 = undefined,
+    internal_bearer_token_len: usize = 0,
+
+    pub fn setInternalBearer(self: *HttpRequestTool, origin: ?[]const u8, token: ?[]const u8) void {
+        self.internal_bearer_origin = origin;
+        @memset(&self.internal_bearer_token, 0);
+        self.internal_bearer_token_len = 0;
+        const value = token orelse return;
+        if (value.len > self.internal_bearer_token.len) return;
+        @memcpy(self.internal_bearer_token[0..value.len], value);
+        self.internal_bearer_token_len = value.len;
+    }
+
+    fn usesInternalBearer(self: *const HttpRequestTool, url: []const u8) bool {
+        const origin = self.internal_bearer_origin orelse return false;
+        if (self.internal_bearer_token_len == 0 or !std.mem.startsWith(u8, url, origin)) return false;
+        return url.len == origin.len or url[origin.len] == '/';
+    }
 
     pub const tool_name = "http_request";
     pub const tool_description = "Make HTTP API requests. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
@@ -119,6 +138,9 @@ pub const HttpRequestTool = struct {
             if (hv == .object) {
                 var it = hv.object.iterator();
                 while (it.next()) |entry| {
+                    if (self.usesInternalBearer(url) and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) {
+                        return ToolResult.fail("Authorization is managed by the selected runtime");
+                    }
                     const val_str = switch (entry.value_ptr.*) {
                         .string => |s| s,
                         else => continue,
@@ -130,6 +152,16 @@ pub const HttpRequestTool = struct {
                 }
             }
         }
+        const body: ?[]const u8 = root.getString(args, "body");
+
+        if (self.usesInternalBearer(url)) {
+            const bearer = try std.fmt.allocPrint(
+                allocator,
+                "Bearer {s}",
+                .{self.internal_bearer_token[0..self.internal_bearer_token_len]},
+            );
+            try header_list.append(allocator, .{ try allocator.dupe(u8, "Authorization"), bearer });
+        }
         const custom_headers = header_list.items;
         defer {
             for (custom_headers) |h| {
@@ -138,8 +170,6 @@ pub const HttpRequestTool = struct {
             }
             header_list.deinit(allocator);
         }
-
-        const body: ?[]const u8 = root.getString(args, "body");
 
         if (builtin.is_test) {
             return ToolResult.fail("Network disabled in tests");
@@ -665,6 +695,18 @@ test "http_request schema has headers" {
     const t = ht.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "headers") != null);
+}
+
+test "http_request internal bearer is scoped to its exact origin" {
+    var ht = HttpRequestTool{};
+    ht.setInternalBearer("http://127.0.0.1:8090", "otb_selector.secret");
+    try std.testing.expect(ht.usesInternalBearer("http://127.0.0.1:8090/api/tasks"));
+    try std.testing.expect(!ht.usesInternalBearer("http://127.0.0.1:80900/api/tasks"));
+    try std.testing.expect(!ht.usesInternalBearer("http://127.0.0.1:8091/api/tasks"));
+    try std.testing.expectEqualStrings("otb_selector.secret", ht.internal_bearer_token[0..ht.internal_bearer_token_len]);
+
+    ht.setInternalBearer("http://127.0.0.1:8090", "otb_replaced.secret");
+    try std.testing.expectEqualStrings("otb_replaced.secret", ht.internal_bearer_token[0..ht.internal_bearer_token_len]);
 }
 
 test "validateMethod accepts valid methods" {

@@ -2920,6 +2920,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (sess.object.get("claim_lockout_secs")) |v| {
                 if (v == .integer and v.integer > 0) self.session.claim_lockout_secs = @intCast(v.integer);
             }
+            if (sess.object.get("overtime_pairing_url")) |v| {
+                if (v == .string and v.string.len > 0) self.session.overtime_pairing_url = try self.allocator.dupe(u8, v.string);
+            }
+            if (sess.object.get("overtime_pairing_service_token")) |v| {
+                if (v == .string and v.string.len > 0) self.session.overtime_pairing_service_token = try self.allocator.dupe(u8, v.string);
+            }
+            if (sess.object.get("overtime_agent_origin")) |v| {
+                if (v == .string and v.string.len > 0) self.session.overtime_agent_origin = try self.allocator.dupe(u8, v.string);
+            }
+            if (sess.object.get("auto_provision_workspace_template")) |v| {
+                if (v == .string and v.string.len > 0) self.session.auto_provision_workspace_template = try self.allocator.dupe(u8, v.string);
+            }
         }
     }
 }

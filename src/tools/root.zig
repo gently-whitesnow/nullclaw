@@ -349,6 +349,8 @@ pub fn allTools(
         http_allowed_domains: []const []const u8 = &.{},
         http_max_response_size: u32 = 1_000_000,
         http_timeout_secs: u64 = 30,
+        http_internal_bearer_token: ?[]const u8 = null,
+        http_internal_bearer_origin: ?[]const u8 = null,
         web_search_base_url: ?[]const u8 = null,
         web_search_provider: []const u8 = "auto",
         web_search_fallback_providers: []const []const u8 = &.{},
@@ -538,6 +540,7 @@ pub fn allTools(
             .max_response_size = opts.http_max_response_size,
             .timeout_secs = opts.http_timeout_secs,
         };
+        ht.setInternalBearer(opts.http_internal_bearer_origin, opts.http_internal_bearer_token);
         try list.append(allocator, ht.tool());
 
         const wst = try allocator.create(web_search.WebSearchTool);
@@ -674,6 +677,8 @@ pub fn subagentTools(
         http_allowed_domains: []const []const u8 = &.{},
         http_max_response_size: u32 = 1_000_000,
         http_timeout_secs: u64 = 30,
+        http_internal_bearer_token: ?[]const u8 = null,
+        http_internal_bearer_origin: ?[]const u8 = null,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         tools_config: @import("../config.zig").ToolsConfig = .{},
@@ -777,6 +782,7 @@ pub fn subagentTools(
             .max_response_size = opts.http_max_response_size,
             .timeout_secs = opts.http_timeout_secs,
         };
+        ht.setInternalBearer(opts.http_internal_bearer_origin, opts.http_internal_bearer_token);
         try list.append(allocator, ht.tool());
     }
 
