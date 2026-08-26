@@ -242,6 +242,8 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
     if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
     if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
     if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+    for (agent_cfg.http_allowed_domains) |domain| allocator.free(domain);
+    if (agent_cfg.http_allowed_domains.len > 0) allocator.free(agent_cfg.http_allowed_domains);
 }
 
 fn parsePrimaryModelObject(
@@ -541,6 +543,9 @@ fn parseNamedAgentObject(
     }
     if (item.object.get("enable_pii_redaction")) |v| {
         if (v == .bool) agent_cfg.enable_pii_redaction = v.bool;
+    }
+    if (item.object.get("http_allowed_domains")) |v| {
+        if (v == .array) agent_cfg.http_allowed_domains = try parseStringArray(allocator, v.array);
     }
     return agent_cfg;
 }

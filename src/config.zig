@@ -156,6 +156,7 @@ const SerializedNamedAgentConfig = struct {
     temperature: ?f64 = null,
     max_depth: u32 = 3,
     enable_pii_redaction: bool = true,
+    http_allowed_domains: []const []const u8 = &.{},
 };
 
 const SerializedModelRouteConfig = struct {
@@ -176,6 +177,8 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
         if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
         if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
         if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+        for (agent_cfg.http_allowed_domains) |domain| allocator.free(domain);
+        if (agent_cfg.http_allowed_domains.len > 0) allocator.free(agent_cfg.http_allowed_domains);
     }
     allocator.free(agents);
 }
@@ -1242,6 +1245,7 @@ pub const Config = struct {
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
                             .enable_pii_redaction = agent_cfg.enable_pii_redaction,
+                            .http_allowed_domains = agent_cfg.http_allowed_domains,
                         };
                         agent_count += 1;
                     }
@@ -5333,6 +5337,32 @@ test "parse agents.list with workspace_path" {
 
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqualStrings("agents/coder", cfg.agents[0].workspace_path.?);
+}
+
+test "parse named agent with http_allowed_domains" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": {"list": [{"name": "coder", "provider": "openai", "model": "gpt-5.2", "http_allowed_domains": ["127.0.0.1:8091"]}]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents[0].http_allowed_domains.len);
+    try std.testing.expectEqualStrings("127.0.0.1:8091", cfg.agents[0].http_allowed_domains[0]);
+}
+
+test "named agent without http_allowed_domains keeps the global list" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": {"list": [{"name": "coder", "provider": "openai", "model": "gpt-5.2"}]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.agents[0].http_allowed_domains.len);
 }
 
 test "resolveAgentWorkspace resolves relative path against config directory" {
