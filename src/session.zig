@@ -6108,3 +6108,49 @@ test "narrowedHttpAllowedDomains falls back to the global list" {
     try testing.expect(try SessionManager.narrowedHttpAllowedDomains(testing.allocator, &global, profile) == null);
     try testing.expect(try SessionManager.narrowedHttpAllowedDomains(testing.allocator, &global, null) == null);
 }
+
+test "agent runtime hands its own http allowlist to http_request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    defer testing.allocator.free(config_path);
+
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.http_request.enabled = true;
+    cfg.http_request.allowed_domains = &.{ "127.0.0.1:8091", "127.0.0.1:8092" };
+    cfg.agents = &.{
+        .{
+            .name = "second",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .workspace_path = "agents/second",
+            .http_allowed_domains = &.{"127.0.0.1:8092"},
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("agent:second:telegram:direct:1000000002");
+
+    sm.mutex.lock();
+    defer sm.mutex.unlock();
+    const runtime = sm.agent_runtimes.get("second").?;
+    try testing.expectEqual(@as(usize, 1), runtime.http_allowed_domains.?.len);
+    try testing.expectEqualStrings("127.0.0.1:8092", runtime.http_allowed_domains.?[0]);
+
+    for (runtime.tools) |tool| {
+        if (!std.mem.eql(u8, tool.name(), "http_request")) continue;
+        const http_tool: *tools_mod.http_request.HttpRequestTool = @ptrCast(@alignCast(tool.ptr));
+        try testing.expectEqual(@as(usize, 1), http_tool.allowed_domains.len);
+        try testing.expectEqualStrings("127.0.0.1:8092", http_tool.allowed_domains[0]);
+        return;
+    }
+    return error.HttpRequestToolMissing;
+}
