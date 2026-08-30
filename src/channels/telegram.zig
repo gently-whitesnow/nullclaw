@@ -2326,24 +2326,6 @@ pub const TelegramChannel = struct {
         self.pending_text_received_at.clearRetainingCapacity();
     }
 
-    fn cancelPendingTextChainForKey(self: *TelegramChannel, id: []const u8, sender: []const u8) void {
-        if (self.pending_text_messages.items.len == 0) return;
-        if (!telegram_ingress.pendingTextBuffersInSync(
-            self.pending_text_messages.items,
-            self.pending_text_received_at.items,
-        )) {
-            self.resetPendingTextBuffers();
-            return;
-        }
-        telegram_ingress.cancelPendingTextChainForKey(
-            self.allocator,
-            &self.pending_text_messages,
-            &self.pending_text_received_at,
-            id,
-            sender,
-        );
-    }
-
     fn maybeSweepTempMediaFiles(self: *TelegramChannel) void {
         self.polls_since_temp_sweep += 1;
         if (self.polls_since_temp_sweep < TEMP_MEDIA_SWEEP_INTERVAL_POLLS) return;
@@ -2614,6 +2596,8 @@ pub const TelegramChannel = struct {
 
         // Flush matured groups buffered across previous poll cycles.
         self.flushMaturedPendingMediaGroups(allocator, &messages, &media_group_ids);
+        self.flushMaturedPendingTextMessages(allocator, &messages, &media_group_ids);
+        const ready_message_count = messages.items.len;
 
         for (result_array) |update| {
             self.processUpdate(allocator, update, &messages, &media_group_ids);
@@ -2694,7 +2678,7 @@ pub const TelegramChannel = struct {
         // Buffer non-command text messages across poll cycles to debounce split
         // Telegram long messages that arrive in separate getUpdates responses.
         {
-            var i: usize = 0;
+            var i: usize = ready_message_count;
             while (i < messages.items.len) {
                 if (!telegram_ingress.shouldDebounceTextMessageWithBase(
                     root.nowEpochSecs(),
@@ -2703,9 +2687,6 @@ pub const TelegramChannel = struct {
                     messages.items[i],
                     self.text_debounce_secs,
                 )) {
-                    // Explicitly cancel stale chain fragments for this sender/chat
-                    // so a fresh message is not blocked by old pending chunks.
-                    self.cancelPendingTextChainForKey(messages.items[i].id, messages.items[i].sender);
                     i += 1;
                     continue;
                 }
@@ -4973,7 +4954,7 @@ test "telegram flushMaturedPendingTextMessages waits for newest chain message" {
     try std.testing.expectEqual(@as(usize, 2), ch.pending_text_messages.items.len);
 
     // Force chain maturity by moving the newest timestamp back.
-    ch.pending_text_received_at.items[1] = now - (telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS + 1);
+    ch.pending_text_received_at.items[1] = now - telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS;
     ch.flushMaturedPendingTextMessages(alloc, &out_messages, &out_group_ids);
 
     try std.testing.expectEqual(@as(usize, 2), out_messages.items.len);

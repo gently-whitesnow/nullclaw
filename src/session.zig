@@ -64,6 +64,24 @@ fn overtimeOriginAllowlistEntry(origin: []const u8) []const u8 {
     return without_scheme[0..path_start];
 }
 
+fn syncWorkspaceTemplateBootstrapDocs(
+    allocator: Allocator,
+    template: []const u8,
+    bootstrap_provider: bootstrap_mod.BootstrapProvider,
+) !void {
+    for (memory_mod.prompt_bootstrap_docs) |doc| {
+        const source_path = try std_compat.fs.path.join(allocator, &.{ template, doc.filename });
+        defer allocator.free(source_path);
+
+        const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, source_path, 256 * 1024) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(content);
+        try bootstrap_provider.store(doc.filename, content);
+    }
+}
+
 fn pairingCode(content: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     const candidate = for ([_][]const u8{ "/start", "/pair" }) |command| {
@@ -1558,6 +1576,12 @@ pub const SessionManager = struct {
         if (std.mem.startsWith(u8, agent_id, "peer-")) {
             if (self.config.session.auto_provision_workspace_template) |template| {
                 try skills_mod.copyWorkspaceTemplate(self.allocator, template, workspace_dir);
+                if (bootstrap_provider) |bp| {
+                    syncWorkspaceTemplateBootstrapDocs(self.allocator, template, bp) catch |err| {
+                        log.err("failed to sync managed workspace template for agent {s}: {s}", .{ agent_id, @errorName(err) });
+                        return err;
+                    };
+                }
             }
         }
 
@@ -3758,6 +3782,41 @@ test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {
     const default_session = try sm.getOrCreate("agent:main:whatsapp_web:direct:5511987654321");
     try testing.expectEqualStrings(base, default_session.agent.workspace_dir);
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "auto-provisioned sqlite peer loads bootstrap docs from workspace template" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    try @import("compat").fs.Dir.wrap(tmp.dir).makeDir("template");
+    {
+        const agents = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("template/AGENTS.md", .{});
+        defer agents.close();
+        try agents.writeAll("managed overtime door");
+    }
+    const template_path = try std.fmt.allocPrint(testing.allocator, "{s}/template", .{base});
+    defer testing.allocator.free(template_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.memory.backend = "sqlite";
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.auto_provision_workspace_template = template_path;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("agent:peer-deadbeefcafebabe:telegram:direct:1001");
+    const runtime = sm.agent_runtimes.get("peer-deadbeefcafebabe").?;
+    const stored_agents = try runtime.bootstrap_provider.?.load(testing.allocator, "AGENTS.md");
+    defer if (stored_agents) |content| testing.allocator.free(content);
+    try testing.expectEqualStrings("managed overtime door", stored_agents.?);
 }
 
 test "two auto-provisioned peers keep distinct deterministic workspaces after restart" {

@@ -80,7 +80,7 @@ fn chainStillWarm(now: u64, stats: PendingTextChainStats, base_debounce_secs: u6
         base_debounce_secs,
     );
     if (debounce_secs == 0) return false;
-    return now <= stats.latest + debounce_secs;
+    return now < stats.latest + debounce_secs;
 }
 
 fn chainIsMature(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
@@ -162,7 +162,7 @@ pub fn shouldDebounceTextMessageWithBase(
         msg.sender,
         pending_messages,
         received_at,
-    ) orelse return false;
+    ) orelse return true;
     return chainStillWarm(now, stats, base_debounce_secs);
 }
 
@@ -198,27 +198,6 @@ pub fn pendingTextChainMatureAtIndexWithBase(
         received_at,
     ) orelse return false;
     return chainIsMature(now, stats, base_debounce_secs);
-}
-
-pub fn cancelPendingTextChainForKey(
-    allocator: std.mem.Allocator,
-    pending_messages: *std.ArrayListUnmanaged(root.ChannelMessage),
-    received_at: *std.ArrayListUnmanaged(u64),
-    id: []const u8,
-    sender: []const u8,
-) void {
-    var i: usize = 0;
-    while (i < pending_messages.items.len and i < received_at.items.len) {
-        const pending = pending_messages.items[i];
-        if (!matchesPendingTextKey(pending, id, sender)) {
-            i += 1;
-            continue;
-        }
-
-        const removed = pending_messages.orderedRemove(i);
-        _ = received_at.orderedRemove(i);
-        removed.deinit(allocator);
-    }
 }
 
 fn findNextMergeCandidateIndex(messages: []const root.ChannelMessage, start: usize) ?usize {
@@ -513,7 +492,7 @@ test "telegram ingress mergeConsecutiveMessages single message no-op" {
     try std.testing.expectEqualStrings("Hello", messages.items[0].content);
 }
 
-test "telegram ingress shouldDebounceTextMessage handles long chunk and active chain" {
+test "telegram ingress shouldDebounceTextMessage starts short and long chains" {
     const alloc = std.testing.allocator;
     var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
     defer deinitOwnedTestMessages(alloc, &pending_messages);
@@ -529,7 +508,10 @@ test "telegram ingress shouldDebounceTextMessage handles long chunk and active c
     try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, long_msg));
 
     const short_msg = testMessage("user-a", "chat-a", "short", now, 2);
-    try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+    try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+
+    const slash_msg = testMessage("user-a", "chat-a", "/status", now, 3);
+    try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, slash_msg));
 
     try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "pending", 0);
     try received_at.append(alloc, now);
@@ -680,29 +662,6 @@ test "telegram ingress mergeConsecutiveMessages allocation failure does not leak
     try std.testing.expectEqualStrings("A", messages.items[0].content);
     try std.testing.expectEqual(@as(usize, large_len), messages.items[1].content.len);
     try std.testing.expectEqual(@as(u8, 'x'), messages.items[1].content[0]);
-}
-
-test "telegram ingress cancelPendingTextChainForKey removes only matching sender chat chain" {
-    const alloc = std.testing.allocator;
-    var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer deinitOwnedTestMessages(alloc, &pending_messages);
-    var received_at: std.ArrayListUnmanaged(u64) = .empty;
-    defer received_at.deinit(alloc);
-
-    const now = root.nowEpochSecs();
-    try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "old-part-a1", 1);
-    try received_at.append(alloc, now - 30);
-    try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "old-part-a2", 2);
-    try received_at.append(alloc, now - 29);
-    try appendOwnedTestMessage(alloc, &pending_messages, "user-b", "chat-b", "keep-me", 3);
-    try received_at.append(alloc, now - 28);
-
-    cancelPendingTextChainForKey(alloc, &pending_messages, &received_at, "user-a", "chat-a");
-
-    try std.testing.expectEqual(@as(usize, 1), pending_messages.items.len);
-    try std.testing.expectEqualStrings("user-b", pending_messages.items[0].id);
-    try std.testing.expectEqualStrings("chat-b", pending_messages.items[0].sender);
-    try std.testing.expectEqual(@as(usize, 1), received_at.items.len);
 }
 
 test "telegram ingress nextPendingTextDeadline returns earliest chain deadline" {
