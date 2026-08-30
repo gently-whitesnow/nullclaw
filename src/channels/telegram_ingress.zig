@@ -162,7 +162,7 @@ pub fn shouldDebounceTextMessageWithBase(
         msg.sender,
         pending_messages,
         received_at,
-    ) orelse return false;
+    ) orelse return true;
     return chainStillWarm(now, stats, base_debounce_secs);
 }
 
@@ -513,7 +513,7 @@ test "telegram ingress mergeConsecutiveMessages single message no-op" {
     try std.testing.expectEqualStrings("Hello", messages.items[0].content);
 }
 
-test "telegram ingress shouldDebounceTextMessage handles long chunk and active chain" {
+test "telegram ingress shouldDebounceTextMessage starts short and long chains" {
     const alloc = std.testing.allocator;
     var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
     defer deinitOwnedTestMessages(alloc, &pending_messages);
@@ -529,7 +529,10 @@ test "telegram ingress shouldDebounceTextMessage handles long chunk and active c
     try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, long_msg));
 
     const short_msg = testMessage("user-a", "chat-a", "short", now, 2);
-    try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+    try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+
+    const slash_msg = testMessage("user-a", "chat-a", "/status", now, 3);
+    try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, slash_msg));
 
     try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "pending", 0);
     try received_at.append(alloc, now);
