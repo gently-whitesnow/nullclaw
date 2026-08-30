@@ -1577,7 +1577,10 @@ pub const SessionManager = struct {
             if (self.config.session.auto_provision_workspace_template) |template| {
                 try skills_mod.copyWorkspaceTemplate(self.allocator, template, workspace_dir);
                 if (bootstrap_provider) |bp| {
-                    try syncWorkspaceTemplateBootstrapDocs(self.allocator, template, bp);
+                    syncWorkspaceTemplateBootstrapDocs(self.allocator, template, bp) catch |err| {
+                        log.err("failed to sync managed workspace template for agent {s}: {s}", .{ agent_id, @errorName(err) });
+                        return err;
+                    };
                 }
             }
         }
